@@ -571,7 +571,7 @@ def cmd_update(args):
         urllib.request.urlretrieve(url, dst + ".new")
         os.replace(dst + ".new", dst)
         log(f"[+] 已更新 {dst}")
-    if args.restart:
+    if not getattr(args, "no_restart", False):
         r = subprocess.run(["systemctl", "restart", args.service])
         log(f"[+] systemctl restart {args.service} -> rc={r.returncode}")
     else:
