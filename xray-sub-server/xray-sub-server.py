@@ -37,8 +37,22 @@ from urllib.parse import urlparse, parse_qs, quote
 VERSION = "1.3.0"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
+USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
 APP = None
 _pub_cache = {}
+
+
+def load_users():
+    try:
+        with open(USERS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_users(d):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
 
 
 def log(m):
@@ -389,12 +403,13 @@ class Handler(BaseHTTPRequestHandler):
             stats = {}
         st = stats.get(email, {"up": 0, "down": 0})
         parts = [f"upload={st['up']}", f"download={st['down']}"]
-        quota = float(getattr(a, "quota_gb", 0) or 0)
+        u = load_users().get(email, {})
+        quota = float(u.get("quota_gb", 0) or 0)
         if quota > 0:
             parts.append(f"total={int(quota * 1024 ** 3)}")
-        days = int(getattr(a, "expire_days", 0) or 0)
-        if days > 0:
-            parts.append(f"expire={int(time.time()) + days * 86400}")
+        exp = int(u.get("expire", 0) or 0)
+        if exp > 0:
+            parts.append(f"expire={exp}")
         return "; ".join(parts)
 
     def log_message(self, fmt, *args):
@@ -410,8 +425,6 @@ def common_args(p):
     p.add_argument("--server", default="")
     p.add_argument("--secret", default="")
     p.add_argument("--stats-api", default="127.0.0.1:10085", help="Xray StatsService 地址")
-    p.add_argument("--quota-gb", type=float, default=0, help="每用户额度(GB)，0=不显示用量上限")
-    p.add_argument("--expire-days", type=int, default=0, help="到期天数，0=不显示到期")
 
 
 def url_base(args):
@@ -486,10 +499,6 @@ def cmd_init(args):
         parts += ["--template", tmpl]
     if getattr(args, "stats_api", "") and args.stats_api != "127.0.0.1:10085":
         parts += ["--stats-api", args.stats_api]
-    if getattr(args, "quota_gb", 0):
-        parts += ["--quota-gb", str(args.quota_gb)]
-    if getattr(args, "expire_days", 0):
-        parts += ["--expire-days", str(args.expire_days)]
 
     unit = ("[Unit]\nDescription=Xray Subscription Server\nAfter=network.target\n\n"
             "[Service]\n"
@@ -569,6 +578,21 @@ def cmd_add_user(args):
     if not args.no_restart:
         subprocess.run(["systemctl", "restart", "xray"])
         log("[+] 已重启 xray")
+    users = load_users()
+    rec = users.get(args.email, {})
+    if getattr(args, "quota_gb", 0):
+        rec["quota_gb"] = args.quota_gb
+    if getattr(args, "expire_days", 0):
+        rec["expire"] = int(time.time()) + args.expire_days * 86400
+    if getattr(args, "expire", ""):
+        try:
+            rec["expire"] = int(args.expire)
+        except Exception:
+            pass
+    if rec:
+        users[args.email] = rec
+        save_users(users)
+        log(f"[+] 已记录额度/到期: {rec}")
     secret = args.secret or service_defaults().get("secret", "")
     args.server = args.server or detect_public_ip()
     if secret:
@@ -605,9 +629,37 @@ def cmd_del_user(args):
         sys.exit(1)
     _save_cfg(f, d)
     log(f"[+] 已删除 {args.email}（其订阅 token 立即失效）")
+    users = load_users()
+    if args.email in users:
+        del users[args.email]
+        save_users(users)
+        log("[+] 已清除其额度/到期记录")
     if not args.no_restart:
         subprocess.run(["systemctl", "restart", "xray"])
         log("[+] 已重启 xray")
+
+
+def cmd_set_user(args):
+    users = load_users()
+    rec = users.get(args.email, {})
+    if args.quota_gb is not None:
+        rec["quota_gb"] = args.quota_gb
+    if args.expire_days:
+        rec["expire"] = int(time.time()) + args.expire_days * 86400
+    if args.expire:
+        try:
+            rec["expire"] = int(args.expire)
+        except Exception:
+            log("[x] --expire 需为 Unix 时间戳")
+            sys.exit(1)
+    if args.clear:
+        rec = {}
+    if rec:
+        users[args.email] = rec
+    else:
+        users.pop(args.email, None)
+    save_users(users)
+    log(f"[+] {args.email} -> {rec if rec else '(无限制)'}")
 
 
 def cmd_update(args):
@@ -633,7 +685,7 @@ def cmd_update(args):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "init", "list", "add-user", "del-user", "update", "version", "-h", "--help"):
+    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "init", "list", "add-user", "del-user", "set-user", "update", "version", "-h", "--help"):
         sys.argv.insert(1, "serve")  # 兼容旧的无子命令用法
 
     ap = argparse.ArgumentParser(prog="xray-sub-server", description="按 Xray 用户分发 Clash 订阅")
@@ -656,6 +708,9 @@ def main():
     au.add_argument("--file", default="")
     au.add_argument("--port", type=int, default=8081)
     au.add_argument("--no-restart", action="store_true")
+    au.add_argument("--quota-gb", type=float, default=0, help="该用户额度(GB)")
+    au.add_argument("--expire-days", type=int, default=0, help="多少天后到期")
+    au.add_argument("--expire", default="", help="到期 Unix 时间戳")
     au.set_defaults(func=cmd_add_user)
 
     du = sub.add_parser("del-user", help="删除用户（其 token 立即失效）")
@@ -664,6 +719,14 @@ def main():
     du.add_argument("--file", default="")
     du.add_argument("--no-restart", action="store_true")
     du.set_defaults(func=cmd_del_user)
+
+    su = sub.add_parser("set-user", help="设置某用户的额度/到期")
+    su.add_argument("--email", required=True)
+    su.add_argument("--quota-gb", type=float, default=None)
+    su.add_argument("--expire-days", type=int, default=0)
+    su.add_argument("--expire", default="", help="到期 Unix 时间戳")
+    su.add_argument("--clear", action="store_true", help="清除限制")
+    su.set_defaults(func=cmd_set_user)
 
     lp = sub.add_parser("list", help="列出每个用户的订阅链接")
     common_args(lp)
