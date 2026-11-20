@@ -517,9 +517,12 @@ def cmd_init(args):
     cmd_status(args)
 
 
-def _fmt(b):
-    """统一按 GB 显示（两位小数）。"""
+def _gb(b):
     return f"{float(b) / (1024 ** 3):.2f}"
+
+
+def _mb(b):
+    return f"{float(b) / (1024 ** 2):.2f}"
 
 
 def cmd_status(args):
@@ -540,9 +543,9 @@ def cmd_status(args):
     all_emails = sorted(xray_emails | set(umeta))
     used_total = sum(stats.get(e, {}).get("up", 0) + stats.get(e, {}).get("down", 0) for e in all_emails)
     if total:
-        print(f"全局: 已用 {_fmt(used_total)} / {_fmt(total)} GB | 剩余 {_fmt(max(0, total - used_total))} GB")
+        print(f"全局: 已用 {_mb(used_total)} MB / {_gb(total)} GB | 剩余 {_gb(max(0, total - used_total))} GB")
     else:
-        print(f"全局: 已用 {_fmt(used_total)} GB (总量未设置)")
+        print(f"全局: 已用 {_mb(used_total)} MB (总量未设置)")
     print("-" * 56)
     if not all_emails:
         print("(没有用户)")
@@ -555,9 +558,9 @@ def cmd_status(args):
         if total and owner == email:
             others = sum(float(x.get("quota_gb", 0) or 0) for e, x in umeta.items() if e != email) * 1024 ** 3
             quota = max(0.0, total - others)
-        qstr = f"{_fmt(quota)} GB" if quota else "无限制"
+        qstr = f"{_gb(quota)} GB" if quota else "无限制"
         tag = "" if email in xray_emails else "  [账号已不在Xray]"
-        print(f"{email}{tag}  已用 {_fmt(used)} GB / 额度 {qstr}")
+        print(f"{email}{tag}  已用 {_mb(used)} MB / 额度 {qstr}")
         links = u.get("links", []) or []
         if links:
             now = time.time()
