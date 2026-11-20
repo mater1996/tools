@@ -511,31 +511,59 @@ def cmd_init(args):
         sys.exit(1)
     log("[+] 服务已启动")
     args.server = args.server or detect_public_ip()
-    cmd_list(args)
+    cmd_status(args)
 
 
-def cmd_list(args):
+def _fmt(b):
+    b = float(b)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024 or unit == "TB":
+            return f"{b:.2f}{unit}"
+        b /= 1024
+
+
+def cmd_status(args):
     fill_defaults(args)
     users = load_users()
-    umeta = {e: v for e, v in users.items() if e != "_meta"}
+    meta = users.get("_meta", {}) or {}
+    total = float(meta.get("total_gb", 0) or 0) * 1024 ** 3
+    owner = meta.get("owner", "")
+    try:
+        stats = query_user_stats(args.xray_bin, getattr(args, "stats_api", "127.0.0.1:10085"))
+    except Exception:
+        stats = {}
     try:
         xray_emails = set(group_by_email(load_nodes(args.conf_dir, args.xray_bin, args.name)))
     except Exception:
         xray_emails = set()
+    umeta = {e: v for e, v in users.items() if e != "_meta"}
     all_emails = sorted(xray_emails | set(umeta))
+    used_total = sum(stats.get(e, {}).get("up", 0) + stats.get(e, {}).get("down", 0) for e in all_emails)
+    if total:
+        print(f"全局: 总量 {_fmt(total)} | 已用 {_fmt(used_total)} | 剩余 {_fmt(max(0, total - used_total))}")
+    else:
+        print(f"全局: 总量 未设置(set-total) | 已用 {_fmt(used_total)}")
+    print("-" * 56)
     if not all_emails:
-        log("[i] Xray 和 users.json 里都没有用户")
+        print("(没有用户)")
         return
     for email in all_emails:
         u = umeta.get(email, {})
+        st = stats.get(email, {"up": 0, "down": 0})
+        used = st.get("up", 0) + st.get("down", 0)
+        quota = float(u.get("quota_gb", 0) or 0) * 1024 ** 3
+        if total and owner == email:
+            others = sum(float(x.get("quota_gb", 0) or 0) for e, x in umeta.items() if e != email) * 1024 ** 3
+            quota = max(0.0, total - others)
+        qstr = _fmt(quota) if quota else "无限制"
+        tag = "" if email in xray_emails else "  [账号已不在Xray]"
+        print(f"{email}{tag}  已用 {_fmt(used)} / 额度 {qstr}")
         links = u.get("links", []) or []
-        quota = u.get("quota_gb", 0) or 0
         if links:
             for ln in links:
-                print(f"{email}\t{sub_url(args, ln['token'])}\tquota={quota}GB")
+                print(f"    {sub_url(args, ln['token'])}")
         else:
-            tag = "" if email in xray_emails else " [不在Xray]"
-            print(f"{email}\t(未纳管{tag}，运行: xray-sub add-sub --email {email})")
+            print(f"    (未纳管，运行: xray-sub add-sub --email {email})")
 
 
 def _write_link(args, email, ln):
@@ -711,7 +739,7 @@ def cmd_update(args):
 
 
 def main():
-    names = ("serve", "init", "list", "add-user", "add-sub", "add-link", "del-sub", "del-link", "set-user",
+    names = ("serve", "init", "status", "list", "add-user", "add-sub", "add-link", "del-sub", "del-link", "set-user",
              "set-total", "del-user", "update", "version", "-h", "--help")
     if len(sys.argv) > 1 and sys.argv[1] not in names:
         sys.argv.insert(1, "serve")
@@ -726,7 +754,8 @@ def main():
 
     ip = sub.add_parser("init"); common_args(ip); ip.set_defaults(func=cmd_init)
 
-    lp = sub.add_parser("list"); common_args(lp); lp.set_defaults(func=cmd_list)
+    lp = sub.add_parser("status", aliases=["list"], help="查看全局/用户流量与订阅")
+    common_args(lp); lp.set_defaults(func=cmd_status)
 
     au = sub.add_parser("add-user"); common_args(au)
     au.add_argument("--email", required=True); au.add_argument("--file", default="")
