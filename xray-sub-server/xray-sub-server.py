@@ -465,6 +465,96 @@ def cmd_init(args):
     cmd_list(args)
 
 
+def _reality_files(conf_dir):
+    out = []
+    for f in sorted(glob.glob(os.path.join(conf_dir, "*.json"))):
+        try:
+            d = json.load(open(f, encoding="utf-8"))
+        except Exception:
+            continue
+        for ib in d.get("inbounds", []) or []:
+            if ib.get("protocol") == "vless" and (ib.get("streamSettings") or {}).get("security") == "reality":
+                out.append(f)
+                break
+    return out
+
+
+def cmd_add_user(args):
+    if os.geteuid() != 0:
+        log("[x] add-user 需要 root")
+        sys.exit(1)
+    if not args.email:
+        log("[x] 需要 --email")
+        sys.exit(1)
+    files = _reality_files(args.conf_dir)
+    if not files:
+        log("[x] 没找到 vless-reality 配置")
+        sys.exit(1)
+    f = args.file or files[0]
+    d = json.load(open(f, encoding="utf-8"))
+    added = False
+    for ib in d.get("inbounds", []) or []:
+        if ib.get("protocol") != "vless":
+            continue
+        cl = ib.setdefault("settings", {}).setdefault("clients", [])
+        if any(c.get("email") == args.email for c in cl):
+            log(f"[x] 用户已存在: {args.email}")
+            sys.exit(1)
+        uuid = subprocess.run([args.xray_bin, "uuid"], capture_output=True, text=True).stdout.strip()
+        cl.append({"id": uuid, "flow": "xtls-rprx-vision", "email": args.email})
+        added = True
+        break
+    if not added:
+        log("[x] 配置里没有可写的 vless inbound")
+        sys.exit(1)
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=4)
+    log(f"[+] 已添加 {args.email} -> {f}")
+    if not args.no_restart:
+        subprocess.run(["systemctl", "restart", "xray"])
+        log("[+] 已重启 xray")
+    secret = args.secret or service_defaults().get("secret", "")
+    args.server = args.server or detect_public_ip()
+    if secret:
+        print(f"{args.email}\t{url_base(args)}/sub?token={token_for(secret, args.email)}")
+    else:
+        log("[i] 未找到 secret，用 xray-sub list 查看链接")
+
+
+def cmd_del_user(args):
+    if os.geteuid() != 0:
+        log("[x] del-user 需要 root")
+        sys.exit(1)
+    if not args.email:
+        log("[x] 需要 --email")
+        sys.exit(1)
+    files = _reality_files(args.conf_dir)
+    if not files:
+        log("[x] 没找到 vless-reality 配置")
+        sys.exit(1)
+    f = args.file or files[0]
+    d = json.load(open(f, encoding="utf-8"))
+    removed = False
+    for ib in d.get("inbounds", []) or []:
+        if ib.get("protocol") != "vless":
+            continue
+        cl = (ib.get("settings") or {}).get("clients") or []
+        new = [c for c in cl if c.get("email") != args.email]
+        if len(new) != len(cl):
+            ib["settings"]["clients"] = new
+            removed = True
+            break
+    if not removed:
+        log(f"[x] 没找到用户: {args.email}")
+        sys.exit(1)
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=4)
+    log(f"[+] 已删除 {args.email}（其订阅 token 立即失效）")
+    if not args.no_restart:
+        subprocess.run(["systemctl", "restart", "xray"])
+        log("[+] 已重启 xray")
+
+
 def cmd_update(args):
     import urllib.request
     os.makedirs(args.dir, exist_ok=True)
@@ -483,7 +573,7 @@ def cmd_update(args):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "init", "list", "update", "version", "-h", "--help"):
+    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "init", "list", "add-user", "del-user", "update", "version", "-h", "--help"):
         sys.argv.insert(1, "serve")  # 兼容旧的无子命令用法
 
     ap = argparse.ArgumentParser(prog="xray-sub-server", description="Xray Reality -> Clash 订阅服务")
@@ -500,6 +590,22 @@ def main():
     common_args(ip)
     ip.add_argument("--token"); ip.add_argument("--secret"); ip.add_argument("--port", type=int, default=8081)
     ip.set_defaults(func=cmd_init)
+
+    au = sub.add_parser("add-user", help="在 Xray 配置里新增用户并打印其订阅链接")
+    common_args(au)
+    au.add_argument("--email", required=True)
+    au.add_argument("--file", default="")
+    au.add_argument("--secret", default="")
+    au.add_argument("--port", type=int, default=8081)
+    au.add_argument("--no-restart", action="store_true")
+    au.set_defaults(func=cmd_add_user)
+
+    du = sub.add_parser("del-user", help="删除用户（其 token 立即失效）")
+    common_args(du)
+    du.add_argument("--email", required=True)
+    du.add_argument("--file", default="")
+    du.add_argument("--no-restart", action="store_true")
+    du.set_defaults(func=cmd_del_user)
 
     lp = sub.add_parser("list", help="列出订阅链接")
     common_args(lp)
