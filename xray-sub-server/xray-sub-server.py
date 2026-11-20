@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.3.0
-读取 Xray 的 Reality 配置，按每个 client(用户)分发 Clash/mihomo 订阅。
+xray-sub-server  v1.4.0
+按 Xray 用户分发订阅。每个用户可拥有多个订阅链接；
+链接首次被拉取时绑定来源 IP，之后只允许该 IP 刷新（防分享）。
 
-每个 Xray client 有独立的 token = hmac(secret, email/id)[:32]：
-  - 加 client → 自动得到新 token
-  - 删 client → token 立即失效(404)
-  - 每个订阅只包含该用户自己的节点
+数据文件 users.json:
+{
+  "email": {
+    "quota_gb": 100, "expire": 1797...,
+    "links": [ {"token": "....", "ip": "1.2.3.4", "created": 1797...} ]
+  }
+}
 
 子命令:
-  serve     启动订阅服务(默认)
-  init      注册 systemd、启动并打印每个用户的订阅链接
-  list      列出每个用户的订阅链接
-  add-user  在 Xray 配置里新增用户并打印其链接
-  del-user  删除用户(其 token 立即失效)
-  update    拉取最新程序与模板并重启
-  version   版本
+  serve      启动订阅服务
+  init       注册 systemd、启动并打印链接
+  list       列出每个用户的链接与绑定 IP
+  add-user   新增 Xray 用户并生成首个链接
+  add-link   给已有用户追加一个链接(多设备)
+  unlink     解绑某链接的 IP(换网络时用)
+  set-user   设置额度/到期
+  del-user   删除用户
+  update     更新程序与模板并重启
+  version    版本
 """
 import argparse
 import glob
-import hashlib
 import hmac
 import json
 import os
@@ -34,7 +40,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
@@ -42,6 +48,11 @@ APP = None
 _pub_cache = {}
 
 
+def log(m):
+    print(m, file=sys.stderr, flush=True)
+
+
+# ---------------- 用户数据 ----------------
 def load_users():
     try:
         with open(USERS_FILE, encoding="utf-8") as f:
@@ -55,12 +66,25 @@ def save_users(d):
         json.dump(d, f, ensure_ascii=False, indent=2)
 
 
-def log(m):
-    print(m, file=sys.stderr, flush=True)
+def find_link(users, token):
+    """按 token 找到 (email, link_dict)。"""
+    for email, u in users.items():
+        for ln in u.get("links", []) or []:
+            if hmac.compare_digest(str(ln.get("token", "")), token or ""):
+                return email, ln
+    return None, None
 
 
+def new_link():
+    return {"token": secrets.token_hex(16), "ip": "", "created": int(time.time())}
+
+
+def get_user(users, email):
+    return users.setdefault(email, {"quota_gb": 0, "expire": 0, "links": []})
+
+
+# ---------------- systemd 参数 ----------------
 def service_defaults():
-    """从已注册的 systemd 服务里读取参数，供 list/serve 免参数复用。"""
     d = {}
     if not os.path.exists(SVC_PATH):
         return d
@@ -105,6 +129,7 @@ def detect_public_ip():
         return ""
 
 
+# ---------------- Xray 配置解析 ----------------
 def pubkey_from_priv(xray_bin, priv):
     if not priv:
         return ""
@@ -137,15 +162,10 @@ def _reality_inbounds(f):
 
 
 def _reality_files(conf_dir):
-    out = []
-    for f in sorted(glob.glob(os.path.join(conf_dir, "*.json"))):
-        if _reality_inbounds(f):
-            out.append(f)
-    return out
+    return [f for f in sorted(glob.glob(os.path.join(conf_dir, "*.json"))) if _reality_inbounds(f)]
 
 
 def load_nodes(conf_dir, xray_bin, base_name):
-    """返回所有 vless-reality client 组成的节点列表（每个 client 一项）。"""
     nodes = []
     for f in _reality_files(conf_dir):
         parsed = _reality_inbounds(f)
@@ -163,7 +183,7 @@ def load_nodes(conf_dir, xray_bin, base_name):
             sid = (rs.get("shortIds") or [""])[0]
             pub = pubkey_from_priv(xray_bin, rs.get("privateKey") or "")
             if not (pub and sni and port):
-                log(f"[warn] {os.path.basename(f)}: 节点字段不完整，跳过")
+                log(f"[warn] {os.path.basename(f)}: 字段不完整，跳过")
                 continue
             for c in clients:
                 if not c.get("id"):
@@ -172,53 +192,11 @@ def load_nodes(conf_dir, xray_bin, base_name):
                     "email": c.get("email") or c["id"],
                     "uuid": c["id"],
                     "flow": c.get("flow") or "xtls-rprx-vision",
-                    "port": int(port),
-                    "sni": sni,
-                    "pub": pub,
-                    "sid": sid,
+                    "port": int(port), "sni": sni, "pub": pub, "sid": sid,
                 })
     for i, n in enumerate(nodes):
         n["name"] = base_name if i == 0 else f"{base_name}-{i + 1}"
     return nodes
-
-
-def token_for(secret, email):
-    return hmac.new(secret.encode(), str(email).encode(), hashlib.sha256).hexdigest()[:32]
-
-
-_stats_cache = {"ts": 0.0, "data": {}}
-
-
-def query_user_stats(xray_bin, api_addr="127.0.0.1:10085", ttl=60):
-    """从 Xray StatsService 读取每个 email 的累计上下行(字节)，带 TTL 缓存。"""
-    now = time.time()
-    if now - _stats_cache["ts"] < ttl:
-        return _stats_cache["data"]
-    data = {}
-    try:
-        out = subprocess.run(
-            [xray_bin, "api", "statsquery", f"--server={api_addr}", "-pattern", "user"],
-            capture_output=True, text=True, timeout=5).stdout
-        j = json.loads(out or "{}")
-        for s in j.get("stat", []) or []:
-            name = s.get("name", "")
-            try:
-                val = int(str(s.get("value", "0")))
-            except Exception:
-                val = 0
-            parts = name.split(">>>")
-            if len(parts) >= 4 and parts[0] == "user":
-                email, kind = parts[1], parts[3]
-                d = data.setdefault(email, {"up": 0, "down": 0})
-                if kind == "uplink":
-                    d["up"] += val
-                elif kind == "downlink":
-                    d["down"] += val
-    except Exception as e:
-        log(f"[warn] stats 查询失败: {e}")
-    _stats_cache["ts"] = now
-    _stats_cache["data"] = data
-    return data
 
 
 def group_by_email(nodes):
@@ -228,19 +206,7 @@ def group_by_email(nodes):
     return d
 
 
-def select_nodes(nodes, secret, token, base_name):
-    """按 token 反查 email，返回该用户自己的节点；无匹配返回 None。"""
-    for email, ns in group_by_email(nodes).items():
-        if hmac.compare_digest(token_for(secret, email), token or ""):
-            out = []
-            for i, n in enumerate(ns):
-                nn = dict(n)
-                nn["name"] = base_name if i == 0 else f"{base_name}-{i + 1}"
-                out.append(nn)
-            return out
-    return None
-
-
+# ---------------- 订阅生成 ----------------
 def gen_proxies_lines(nodes, server):
     lines = []
     for n in nodes:
@@ -308,10 +274,45 @@ def inject_template(template_text, nodes, server, base_name="JP-Reality", group_
     return result
 
 
+# ---------------- 用量 ----------------
+_stats_cache = {"ts": 0.0, "data": {}}
+
+
+def query_user_stats(xray_bin, api_addr="127.0.0.1:10085", ttl=60):
+    now = time.time()
+    if now - _stats_cache["ts"] < ttl:
+        return _stats_cache["data"]
+    data = {}
+    try:
+        out = subprocess.run(
+            [xray_bin, "api", "statsquery", f"--server={api_addr}", "-pattern", "user"],
+            capture_output=True, text=True, timeout=5).stdout
+        j = json.loads(out or "{}")
+        for s in j.get("stat", []) or []:
+            name = s.get("name", "")
+            try:
+                val = int(str(s.get("value", "0")))
+            except Exception:
+                val = 0
+            parts = name.split(">>>")
+            if len(parts) >= 4 and parts[0] == "user":
+                email, kind = parts[1], parts[3]
+                d = data.setdefault(email, {"up": 0, "down": 0})
+                if kind == "uplink":
+                    d["up"] += val
+                elif kind == "downlink":
+                    d["down"] += val
+    except Exception as e:
+        log(f"[warn] stats 查询失败: {e}")
+    _stats_cache["ts"] = now
+    _stats_cache["data"] = data
+    return data
+
+
+# ---------------- App / Handler ----------------
 class App:
     def __init__(self, args):
         self.args = args
-        self.secret = args.secret or ""
         self.template = ""
         if args.template and os.path.exists(args.template):
             self.template = open(args.template, encoding="utf-8").read()
@@ -325,25 +326,20 @@ class App:
         if not self.server:
             log("[warn] 无法自动探测公网 IP，请用 --server 指定")
 
-    def resolve(self, token):
-        """按 token 反查用户，返回 (订阅正文, email)；无效返回 (None, None)。"""
+    def render_email(self, email):
         nodes = load_nodes(self.args.conf_dir, self.args.xray_bin, self.args.name)
-        if not nodes:
-            raise RuntimeError("未从 Xray 配置中找到可用的 Reality 节点")
-        email = None
-        for e in group_by_email(nodes):
-            if hmac.compare_digest(token_for(self.secret, e), token or ""):
-                email = e
-                break
-        if email is None:
-            return None, None
-        sel = select_nodes(nodes, self.secret, token, self.args.name)
+        g = group_by_email(nodes)
+        if email not in g:
+            return None
+        sel = []
+        for i, n in enumerate(g[email]):
+            nn = dict(n)
+            nn["name"] = self.args.name if i == 0 else f"{self.args.name}-{i + 1}"
+            sel.append(nn)
         if self.template:
-            body = inject_template(self.template, sel, self.server, self.args.name,
+            return inject_template(self.template, sel, self.server, self.args.name,
                                    getattr(self.args, "group_name", ""))
-        else:
-            body = gen_profile(sel, self.server)
-        return body, email
+        return gen_profile(sel, self.server)
 
 
 def extract_token(handler, path):
@@ -363,21 +359,43 @@ def extract_token(handler, path):
     return p
 
 
+def client_ip(handler):
+    xff = handler.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return handler.client_address[0]
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "xray-sub/1.3"
+    server_version = "xray-sub/1.4"
 
     def do_GET(self):
         u = urlparse(self.path)
         p = u.path.rstrip("/")
         token = extract_token(self, p)
+        users = load_users()
+        email, ln = find_link(users, token)
+        if not email:
+            self.send_error(404, "invalid token")
+            return
+        ip = client_ip(self)
+        bound = (ln.get("ip") or "").strip()
+        if bound and bound != ip:
+            log(f"[deny] {email} 绑定 {bound}，来自 {ip}")
+            self.send_error(403, "subscription bound to another IP")
+            return
+        if not bound:
+            ln["ip"] = ip
+            save_users(users)
+            log(f"[+] {email} 首次激活，绑定 IP {ip}")
         try:
-            body, email = APP.resolve(token)
+            body = APP.render_email(email)
         except Exception as e:
             log(f"[error] {e}")
             self.send_error(503, str(e))
             return
         if body is None:
-            self.send_error(404, "invalid token")
+            self.send_error(404, "user not found in xray")
             return
         data = body.encode("utf-8")
         name_hint = APP.profile_title or getattr(APP.args, "group_name", "") or APP.args.name or "xray-sub"
@@ -416,6 +434,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+# ---------------- CLI ----------------
 def common_args(p):
     p.add_argument("--conf-dir", default="/etc/xray/conf")
     p.add_argument("--xray-bin", default="/etc/xray/bin/xray")
@@ -423,8 +442,8 @@ def common_args(p):
     p.add_argument("--group-name", default="", help="替换模板里的策略组名 XQ-Network")
     p.add_argument("--template", default="")
     p.add_argument("--server", default="")
-    p.add_argument("--secret", default="")
-    p.add_argument("--stats-api", default="127.0.0.1:10085", help="Xray StatsService 地址")
+    p.add_argument("--port", type=int, default=8081)
+    p.add_argument("--stats-api", default="127.0.0.1:10085")
 
 
 def url_base(args):
@@ -433,26 +452,18 @@ def url_base(args):
     return f"{scheme}://{ip}:{getattr(args, 'port', 8081)}"
 
 
+def sub_url(args, token):
+    return f"{url_base(args)}/sub?token={token}"
+
+
 def cmd_serve(args):
     global APP
     fill_defaults(args)
-    if not args.secret:
-        args.secret = secrets.token_hex(16)
-        log("[i] 未指定 secret，自动生成临时 secret（建议用 xray-sub init 持久化）")
     APP = App(args)
-    try:
-        nodes = load_nodes(args.conf_dir, args.xray_bin, args.name)
-        emails = list(group_by_email(nodes))
-        if not emails:
-            log("[x] 没有找到任何用户")
-            sys.exit(1)
-        sample, _ = APP.resolve(token_for(args.secret, emails[0]))
-        if sample is None:
-            log("[x] 启动校验失败")
-            sys.exit(1)
-        log(f"[+] 启动校验通过，订阅大小 {len(sample)} 字节")
-    except Exception as e:
-        log(f"[x] 启动校验失败: {e}")
+    users = load_users()
+    emails = [e for e in users if users[e].get("links")]
+    if not emails:
+        log("[x] users.json 里没有任何用户链接，先 xray-sub add-user")
         sys.exit(1)
     httpd = ThreadingHTTPServer((args.listen, args.port), Handler)
     scheme = "http"
@@ -461,7 +472,7 @@ def cmd_serve(args):
         ctx.load_cert_chain(args.tls_cert, args.tls_key)
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
-    log(f"[+] 订阅服务已启动: {url_base(args)}/sub?token=<token>")
+    log(f"[+] 订阅服务已启动: {url_base(args)}/sub?token=<token>  ({len(emails)} 个用户)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -470,27 +481,16 @@ def cmd_serve(args):
 
 def cmd_init(args):
     if os.geteuid() != 0:
-        log("[x] init 需要 root 权限")
+        log("[x] init 需要 root")
         sys.exit(1)
-    if not os.path.isdir(args.conf_dir):
-        log(f"[x] 配置目录不存在: {args.conf_dir}")
-        sys.exit(1)
-    if not (os.path.isfile(args.xray_bin) and os.access(args.xray_bin, os.X_OK)):
-        log(f"[x] 找不到可执行的 xray: {args.xray_bin}")
-        sys.exit(1)
-
     d = service_defaults()
-    secret = args.secret or d.get("secret", "") or secrets.token_hex(16)
-
     tmpl = args.template or os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.yaml")
     if not os.path.exists(tmpl):
         tmpl = ""
-
     exe = sys.executable or "/usr/bin/python3"
     script = os.path.abspath(__file__)
-    parts = [exe, script, "serve",
-             "--conf-dir", args.conf_dir, "--xray-bin", args.xray_bin,
-             "--port", str(args.port), "--name", args.name, "--secret", secret]
+    parts = [exe, script, "serve", "--conf-dir", args.conf_dir, "--xray-bin", args.xray_bin,
+             "--port", str(args.port), "--name", args.name]
     if args.server:
         parts += ["--server", args.server]
     if args.group_name:
@@ -499,11 +499,8 @@ def cmd_init(args):
         parts += ["--template", tmpl]
     if getattr(args, "stats_api", "") and args.stats_api != "127.0.0.1:10085":
         parts += ["--stats-api", args.stats_api]
-
     unit = ("[Unit]\nDescription=Xray Subscription Server\nAfter=network.target\n\n"
-            "[Service]\n"
-            f"ExecStart={' '.join(parts)}\n"
-            "Restart=always\nRestartSec=3\n\n"
+            "[Service]\n" f"ExecStart={' '.join(parts)}\n" "Restart=always\nRestartSec=3\n\n"
             "[Install]\nWantedBy=multi-user.target\n")
     with open(SVC_PATH, "w", encoding="utf-8") as f:
         f.write(unit)
@@ -512,45 +509,33 @@ def cmd_init(args):
     subprocess.run(["systemctl", "enable", "--now", "xray-sub"])
     time.sleep(1)
     if subprocess.run(["systemctl", "is-active", "--quiet", "xray-sub"]).returncode != 0:
-        log("[x] 启动失败，用 journalctl -u xray-sub -n 30 查看")
+        log("[x] 启动失败，journalctl -u xray-sub -n 30 查看")
         sys.exit(1)
     log("[+] 服务已启动")
-    args.secret = secret
     args.server = args.server or detect_public_ip()
-    log("[+] 订阅链接：")
     cmd_list(args)
 
 
 def cmd_list(args):
     fill_defaults(args)
-    if not args.secret:
-        log("[x] 没有 secret，请先 xray-sub init")
-        sys.exit(1)
-    nodes = load_nodes(args.conf_dir, args.xray_bin, args.name)
-    if not nodes:
-        log("[x] 没有找到可用节点")
-        sys.exit(1)
+    users = load_users()
+    if not users:
+        log("[i] 还没有用户。用 xray-sub add-user --email xxx")
+        return
     base = url_base(args)
-    for email in sorted(group_by_email(nodes)):
-        print(f"{email}\t{base}/sub?token={token_for(args.secret, email)}")
+    for email in sorted(users):
+        for ln in users[email].get("links", []) or []:
+            ip = ln.get("ip") or "(未激活)"
+            print(f"{email}\t{sub_url(args, ln['token'])}\tIP={ip}")
 
 
-def _load_cfg(f):
-    with open(f, encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def _save_cfg(f, d):
-    with open(f, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, ensure_ascii=False, indent=4)
+def _write_link(args, email, ln, quota=None, expire=None):
+    print(f"{email}\t{sub_url(args, ln['token'])}\tIP={ln.get('ip') or '(首次拉取时绑定)'}")
 
 
 def cmd_add_user(args):
     if os.geteuid() != 0:
         log("[x] add-user 需要 root")
-        sys.exit(1)
-    if not args.email:
-        log("[x] 需要 --email")
         sys.exit(1)
     files = _reality_files(args.conf_dir)
     if not files:
@@ -558,7 +543,6 @@ def cmd_add_user(args):
         sys.exit(1)
     f = args.file or files[0]
     d = _load_cfg(f)
-    added = False
     for ib in d.get("inbounds", []) or []:
         if ib.get("protocol") != "vless":
             continue
@@ -568,45 +552,74 @@ def cmd_add_user(args):
             sys.exit(1)
         uuid = subprocess.run([args.xray_bin, "uuid"], capture_output=True, text=True).stdout.strip()
         cl.append({"id": uuid, "flow": "xtls-rprx-vision", "email": args.email, "level": 0})
-        added = True
         break
-    if not added:
-        log("[x] 配置里没有可写的 vless inbound")
-        sys.exit(1)
     _save_cfg(f, d)
     log(f"[+] 已添加 {args.email} -> {f}")
     if not args.no_restart:
         subprocess.run(["systemctl", "restart", "xray"])
         log("[+] 已重启 xray")
     users = load_users()
-    rec = users.get(args.email, {})
-    if getattr(args, "quota_gb", 0):
-        rec["quota_gb"] = args.quota_gb
-    if getattr(args, "expire_days", 0):
-        rec["expire"] = int(time.time()) + args.expire_days * 86400
-    if getattr(args, "expire", ""):
+    u = get_user(users, args.email)
+    if args.quota_gb:
+        u["quota_gb"] = args.quota_gb
+    if args.expire_days:
+        u["expire"] = int(time.time()) + args.expire_days * 86400
+    if args.expire:
         try:
-            rec["expire"] = int(args.expire)
+            u["expire"] = int(args.expire)
         except Exception:
             pass
-    if rec:
-        users[args.email] = rec
-        save_users(users)
-        log(f"[+] 已记录额度/到期: {rec}")
-    secret = args.secret or service_defaults().get("secret", "")
+    ln = new_link()
+    u.setdefault("links", []).append(ln)
+    save_users(users)
     args.server = args.server or detect_public_ip()
-    if secret:
-        print(f"{args.email}\t{url_base(args)}/sub?token={token_for(secret, args.email)}")
-    else:
-        log("[i] 未找到 secret，用 xray-sub list 查看链接")
+    _write_link(args, args.email, ln)
+
+
+def cmd_add_link(args):
+    users = load_users()
+    u = get_user(users, args.email)
+    ln = new_link()
+    u.setdefault("links", []).append(ln)
+    save_users(users)
+    args.server = args.server or detect_public_ip()
+    _write_link(args, args.email, ln)
+
+
+def cmd_unlink(args):
+    users = load_users()
+    email, ln = find_link(users, args.token)
+    if not email:
+        log("[x] token 不存在")
+        sys.exit(1)
+    ln["ip"] = ""
+    save_users(users)
+    log(f"[+] 已解绑 {email} 的 {args.token[:8]}...，可重新绑定新 IP")
+
+
+def cmd_set_user(args):
+    users = load_users()
+    u = get_user(users, args.email)
+    if args.quota_gb is not None:
+        u["quota_gb"] = args.quota_gb
+    if args.expire_days:
+        u["expire"] = int(time.time()) + args.expire_days * 86400
+    if args.expire:
+        try:
+            u["expire"] = int(args.expire)
+        except Exception:
+            log("[x] --expire 需为 Unix 时间戳")
+            sys.exit(1)
+    if args.clear:
+        u["quota_gb"] = 0
+        u["expire"] = 0
+    save_users(users)
+    log(f"[+] {args.email}: quota={u.get('quota_gb')}GB expire={u.get('expire')}")
 
 
 def cmd_del_user(args):
     if os.geteuid() != 0:
         log("[x] del-user 需要 root")
-        sys.exit(1)
-    if not args.email:
-        log("[x] 需要 --email")
         sys.exit(1)
     files = _reality_files(args.conf_dir)
     if not files:
@@ -628,38 +641,24 @@ def cmd_del_user(args):
         log(f"[x] 没找到用户: {args.email}")
         sys.exit(1)
     _save_cfg(f, d)
-    log(f"[+] 已删除 {args.email}（其订阅 token 立即失效）")
     users = load_users()
     if args.email in users:
         del users[args.email]
         save_users(users)
-        log("[+] 已清除其额度/到期记录")
+    log(f"[+] 已删除 {args.email}，其所有链接立即失效")
     if not args.no_restart:
         subprocess.run(["systemctl", "restart", "xray"])
         log("[+] 已重启 xray")
 
 
-def cmd_set_user(args):
-    users = load_users()
-    rec = users.get(args.email, {})
-    if args.quota_gb is not None:
-        rec["quota_gb"] = args.quota_gb
-    if args.expire_days:
-        rec["expire"] = int(time.time()) + args.expire_days * 86400
-    if args.expire:
-        try:
-            rec["expire"] = int(args.expire)
-        except Exception:
-            log("[x] --expire 需为 Unix 时间戳")
-            sys.exit(1)
-    if args.clear:
-        rec = {}
-    if rec:
-        users[args.email] = rec
-    else:
-        users.pop(args.email, None)
-    save_users(users)
-    log(f"[+] {args.email} -> {rec if rec else '(无限制)'}")
+def _load_cfg(f):
+    with open(f, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _save_cfg(f, d):
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=4)
 
 
 def cmd_update(args):
@@ -685,68 +684,55 @@ def cmd_update(args):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "init", "list", "add-user", "del-user", "set-user", "update", "version", "-h", "--help"):
-        sys.argv.insert(1, "serve")  # 兼容旧的无子命令用法
+    names = ("serve", "init", "list", "add-user", "add-link", "unlink", "set-user",
+             "del-user", "update", "version", "-h", "--help")
+    if len(sys.argv) > 1 and sys.argv[1] not in names:
+        sys.argv.insert(1, "serve")
 
     ap = argparse.ArgumentParser(prog="xray-sub-server", description="按 Xray 用户分发 Clash 订阅")
     sub = ap.add_subparsers(dest="cmd")
 
-    sp = sub.add_parser("serve", help="启动订阅服务")
-    common_args(sp)
-    sp.add_argument("--listen", default="0.0.0.0"); sp.add_argument("--port", type=int, default=8081)
+    sp = sub.add_parser("serve"); common_args(sp)
+    sp.add_argument("--listen", default="0.0.0.0")
     sp.add_argument("--tls-cert", default=""); sp.add_argument("--tls-key", default="")
     sp.set_defaults(func=cmd_serve)
 
-    ip = sub.add_parser("init", help="注册 systemd、启动并打印每个用户链接")
-    common_args(ip)
-    ip.add_argument("--port", type=int, default=8081)
-    ip.set_defaults(func=cmd_init)
+    ip = sub.add_parser("init"); common_args(ip); ip.set_defaults(func=cmd_init)
 
-    au = sub.add_parser("add-user", help="新增用户并打印其订阅链接")
-    common_args(au)
-    au.add_argument("--email", required=True)
-    au.add_argument("--file", default="")
-    au.add_argument("--port", type=int, default=8081)
+    lp = sub.add_parser("list"); common_args(lp); lp.set_defaults(func=cmd_list)
+
+    au = sub.add_parser("add-user"); common_args(au)
+    au.add_argument("--email", required=True); au.add_argument("--file", default="")
     au.add_argument("--no-restart", action="store_true")
-    au.add_argument("--quota-gb", type=float, default=0, help="该用户额度(GB)")
-    au.add_argument("--expire-days", type=int, default=0, help="多少天后到期")
-    au.add_argument("--expire", default="", help="到期 Unix 时间戳")
+    au.add_argument("--quota-gb", type=float, default=0); au.add_argument("--expire-days", type=int, default=0)
+    au.add_argument("--expire", default="")
     au.set_defaults(func=cmd_add_user)
 
-    du = sub.add_parser("del-user", help="删除用户（其 token 立即失效）")
-    common_args(du)
-    du.add_argument("--email", required=True)
-    du.add_argument("--file", default="")
-    du.add_argument("--no-restart", action="store_true")
-    du.set_defaults(func=cmd_del_user)
+    al = sub.add_parser("add-link"); common_args(al); al.add_argument("--email", required=True)
+    al.set_defaults(func=cmd_add_link)
 
-    su = sub.add_parser("set-user", help="设置某用户的额度/到期")
-    su.add_argument("--email", required=True)
-    su.add_argument("--quota-gb", type=float, default=None)
-    su.add_argument("--expire-days", type=int, default=0)
-    su.add_argument("--expire", default="", help="到期 Unix 时间戳")
-    su.add_argument("--clear", action="store_true", help="清除限制")
+    ul = sub.add_parser("unlink"); ul.add_argument("--token", required=True)
+    ul.set_defaults(func=cmd_unlink)
+
+    su = sub.add_parser("set-user"); su.add_argument("--email", required=True)
+    su.add_argument("--quota-gb", type=float, default=None); su.add_argument("--expire-days", type=int, default=0)
+    su.add_argument("--expire", default=""); su.add_argument("--clear", action="store_true")
     su.set_defaults(func=cmd_set_user)
 
-    lp = sub.add_parser("list", help="列出每个用户的订阅链接")
-    common_args(lp)
-    lp.add_argument("--port", type=int, default=8081)
-    lp.set_defaults(func=cmd_list)
+    du = sub.add_parser("del-user"); common_args(du); du.add_argument("--email", required=True)
+    du.add_argument("--file", default=""); du.add_argument("--no-restart", action="store_true")
+    du.set_defaults(func=cmd_del_user)
 
-    up = sub.add_parser("update", help="拉取最新程序与模板并重启")
-    up.add_argument("--repo-raw", default=DEFAULT_REPO)
-    up.add_argument("--dir", default="/opt/xray-sub")
-    up.add_argument("--service", default="xray-sub")
+    up = sub.add_parser("update"); up.add_argument("--repo-raw", default=DEFAULT_REPO)
+    up.add_argument("--dir", default="/opt/xray-sub"); up.add_argument("--service", default="xray-sub")
     up.add_argument("--no-restart", action="store_true")
     up.set_defaults(func=cmd_update)
 
-    vp = sub.add_parser("version", help="显示版本")
-    vp.set_defaults(func=lambda a: print(f"xray-sub-server {VERSION}"))
+    vp = sub.add_parser("version"); vp.set_defaults(func=lambda a: print(f"xray-sub-server {VERSION}"))
 
     args = ap.parse_args()
     if not getattr(args, "func", None):
-        ap.print_help()
-        return
+        ap.print_help(); return
     args.func(args)
 
 
