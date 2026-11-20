@@ -172,6 +172,41 @@ def token_for(secret, email):
     return hmac.new(secret.encode(), str(email).encode(), hashlib.sha256).hexdigest()[:32]
 
 
+_stats_cache = {"ts": 0.0, "data": {}}
+
+
+def query_user_stats(xray_bin, api_addr="127.0.0.1:10085", ttl=60):
+    """从 Xray StatsService 读取每个 email 的累计上下行(字节)，带 TTL 缓存。"""
+    now = time.time()
+    if now - _stats_cache["ts"] < ttl:
+        return _stats_cache["data"]
+    data = {}
+    try:
+        out = subprocess.run(
+            [xray_bin, "api", "statsquery", f"--server={api_addr}", "-pattern", "user"],
+            capture_output=True, text=True, timeout=5).stdout
+        j = json.loads(out or "{}")
+        for s in j.get("stat", []) or []:
+            name = s.get("name", "")
+            try:
+                val = int(str(s.get("value", "0")))
+            except Exception:
+                val = 0
+            parts = name.split(">>>")
+            if len(parts) >= 4 and parts[0] == "user":
+                email, kind = parts[1], parts[3]
+                d = data.setdefault(email, {"up": 0, "down": 0})
+                if kind == "uplink":
+                    d["up"] += val
+                elif kind == "downlink":
+                    d["down"] += val
+    except Exception as e:
+        log(f"[warn] stats 查询失败: {e}")
+    _stats_cache["ts"] = now
+    _stats_cache["data"] = data
+    return data
+
+
 def group_by_email(nodes):
     d = {}
     for n in nodes:
@@ -276,17 +311,25 @@ class App:
         if not self.server:
             log("[warn] 无法自动探测公网 IP，请用 --server 指定")
 
-    def render(self, token):
+    def resolve(self, token):
+        """按 token 反查用户，返回 (订阅正文, email)；无效返回 (None, None)。"""
         nodes = load_nodes(self.args.conf_dir, self.args.xray_bin, self.args.name)
         if not nodes:
             raise RuntimeError("未从 Xray 配置中找到可用的 Reality 节点")
+        email = None
+        for e in group_by_email(nodes):
+            if hmac.compare_digest(token_for(self.secret, e), token or ""):
+                email = e
+                break
+        if email is None:
+            return None, None
         sel = select_nodes(nodes, self.secret, token, self.args.name)
-        if sel is None:
-            return None
         if self.template:
-            return inject_template(self.template, sel, self.server, self.args.name,
+            body = inject_template(self.template, sel, self.server, self.args.name,
                                    getattr(self.args, "group_name", ""))
-        return gen_profile(sel, self.server)
+        else:
+            body = gen_profile(sel, self.server)
+        return body, email
 
 
 def extract_token(handler, path):
@@ -314,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
         p = u.path.rstrip("/")
         token = extract_token(self, p)
         try:
-            body = APP.render(token)
+            body, email = APP.resolve(token)
         except Exception as e:
             log(f"[error] {e}")
             self.send_error(503, str(e))
@@ -331,9 +374,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(fname, safe=""))
         self.send_header("Profile-Update-Interval", "12")
         self.send_header("Cache-Control", "no-store")
+        info = self.userinfo(email)
+        if info:
+            self.send_header("Subscription-Userinfo", info)
         self.end_headers()
         self.wfile.write(data)
-        log(f"[ok] {self.address_string()} -> subscription ({len(data)} bytes)")
+        log(f"[ok] {self.address_string()} -> {email} ({len(data)} bytes)")
+
+    def userinfo(self, email):
+        a = APP.args
+        try:
+            stats = query_user_stats(a.xray_bin, getattr(a, "stats_api", "127.0.0.1:10085"))
+        except Exception:
+            stats = {}
+        st = stats.get(email, {"up": 0, "down": 0})
+        parts = [f"upload={st['up']}", f"download={st['down']}"]
+        quota = float(getattr(a, "quota_gb", 0) or 0)
+        if quota > 0:
+            parts.append(f"total={int(quota * 1024 ** 3)}")
+        days = int(getattr(a, "expire_days", 0) or 0)
+        if days > 0:
+            parts.append(f"expire={int(time.time()) + days * 86400}")
+        return "; ".join(parts)
 
     def log_message(self, fmt, *args):
         pass
@@ -347,6 +409,9 @@ def common_args(p):
     p.add_argument("--template", default="")
     p.add_argument("--server", default="")
     p.add_argument("--secret", default="")
+    p.add_argument("--stats-api", default="127.0.0.1:10085", help="Xray StatsService 地址")
+    p.add_argument("--quota-gb", type=float, default=0, help="每用户额度(GB)，0=不显示用量上限")
+    p.add_argument("--expire-days", type=int, default=0, help="到期天数，0=不显示到期")
 
 
 def url_base(args):
@@ -368,7 +433,7 @@ def cmd_serve(args):
         if not emails:
             log("[x] 没有找到任何用户")
             sys.exit(1)
-        sample = APP.render(token_for(args.secret, emails[0]))
+        sample, _ = APP.resolve(token_for(args.secret, emails[0]))
         if sample is None:
             log("[x] 启动校验失败")
             sys.exit(1)
@@ -419,6 +484,12 @@ def cmd_init(args):
         parts += ["--group-name", args.group_name]
     if tmpl:
         parts += ["--template", tmpl]
+    if getattr(args, "stats_api", "") and args.stats_api != "127.0.0.1:10085":
+        parts += ["--stats-api", args.stats_api]
+    if getattr(args, "quota_gb", 0):
+        parts += ["--quota-gb", str(args.quota_gb)]
+    if getattr(args, "expire_days", 0):
+        parts += ["--expire-days", str(args.expire_days)]
 
     unit = ("[Unit]\nDescription=Xray Subscription Server\nAfter=network.target\n\n"
             "[Service]\n"
