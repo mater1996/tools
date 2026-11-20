@@ -305,9 +305,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         p = u.path.rstrip("/")
-        if p not in ("", "/", "/sub", "/clash") and not p.endswith(".yaml") and not p.startswith("/sub/") and not p.startswith("/clash/"):
-            self.send_error(404, "not found")
-            return
         token = extract_token(self, p)
         if not APP.multi and not hmac.compare_digest(token or "", APP.args.token or ""):
             self.send_error(404, "not found")
@@ -322,9 +319,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "invalid token")
             return
         data = body.encode("utf-8")
+        name_hint = p.strip("/")
+        if not name_hint or name_hint in ("sub", "clash") or name_hint.endswith(".yaml"):
+            name_hint = "xray-sub"
         self.send_response(200)
         self.send_header("Content-Type", "text/yaml; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Profile-Title", name_hint)
         self.send_header("Profile-Update-Interval", "12")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
