@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.2.0
-读取 Xray 的 Reality 配置，生成 Clash/mihomo 订阅，内置 HTTP(S) 服务提供。
+xray-sub-server  v1.3.0
+读取 Xray 的 Reality 配置，按每个 client(用户)分发 Clash/mihomo 订阅。
+
+每个 Xray client 有独立的 token = hmac(secret, email/id)[:32]：
+  - 加 client → 自动得到新 token
+  - 删 client → token 立即失效(404)
+  - 每个订阅只包含该用户自己的节点
 
 子命令:
   serve     启动订阅服务(默认)
-  list      列出订阅链接(多用户时可列出每个用户各自的链接)
-  update    从 GitHub 拉取最新程序与模板并重启 systemd 服务
+  init      注册 systemd、启动并打印每个用户的订阅链接
+  list      列出每个用户的订阅链接
+  add-user  在 Xray 配置里新增用户并打印其链接
+  del-user  删除用户(其 token 立即失效)
+  update    拉取最新程序与模板并重启
   version   版本
-
-两种模式:
-  单用户  --token <全局token>            一个 token 拉全部节点
-  多用户  --secret <随机密钥>            每个 Xray client 一个独立 token(HMAC 派生)
-
-多用户 token = HMAC-SHA256(secret, email/id)[:32]，删掉该 client 后 token 自动失效(404)。
 """
 import argparse
 import glob
@@ -32,7 +34,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 APP = None
@@ -109,26 +111,37 @@ def pubkey_from_priv(xray_bin, priv):
     return pub
 
 
-def load_nodes(conf_dir, xray_bin, base_name):
-    """返回所有 vless-reality client 组成的节点列表(每个 client 一项)。"""
-    nodes = []
+def _reality_inbounds(f):
+    try:
+        with open(f, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:
+        return None
+    out = [ib for ib in (d.get("inbounds") or [])
+           if ib.get("protocol") == "vless" and (ib.get("streamSettings") or {}).get("security") == "reality"]
+    return (d, out) if out else None
+
+
+def _reality_files(conf_dir):
+    out = []
     for f in sorted(glob.glob(os.path.join(conf_dir, "*.json"))):
-        try:
-            with open(f, encoding="utf-8") as fh:
-                d = json.load(fh)
-        except Exception as e:
-            log(f"[warn] 跳过 {f}: {e}")
+        if _reality_inbounds(f):
+            out.append(f)
+    return out
+
+
+def load_nodes(conf_dir, xray_bin, base_name):
+    """返回所有 vless-reality client 组成的节点列表（每个 client 一项）。"""
+    nodes = []
+    for f in _reality_files(conf_dir):
+        parsed = _reality_inbounds(f)
+        if not parsed:
             continue
-        for ib in d.get("inbounds", []) or []:
-            if ib.get("protocol") != "vless":
-                continue
+        d, inbounds = parsed
+        for ib in inbounds:
             ss = ib.get("streamSettings") or {}
-            if ss.get("security") != "reality":
-                continue
             rs = ss.get("realitySettings") or {}
             clients = ((ib.get("settings") or {}).get("clients")) or []
-            if not clients:
-                continue
             port = ib.get("listen_port") or ib.get("port")
             target = rs.get("dest") or rs.get("target") or ""
             sns = rs.get("serverNames") or []
@@ -167,24 +180,16 @@ def group_by_email(nodes):
 
 
 def select_nodes(nodes, secret, token, base_name):
-    """按 secret+token 选出该用户的节点；单用户(secret 为空)返回全部。"""
-    if not secret:
-        sel = nodes
-    else:
-        sel = None
-        for email, ns in group_by_email(nodes).items():
-            if hmac.compare_digest(token_for(secret, email), token or ""):
-                sel = ns
-                break
-        if sel is None:
-            return None
-    # 重新命名：每个订阅里都从 base_name 开始
-    out = []
-    for i, n in enumerate(sel):
-        nn = dict(n)
-        nn["name"] = base_name if i == 0 else f"{base_name}-{i + 1}"
-        out.append(nn)
-    return out
+    """按 token 反查 email，返回该用户自己的节点；无匹配返回 None。"""
+    for email, ns in group_by_email(nodes).items():
+        if hmac.compare_digest(token_for(secret, email), token or ""):
+            out = []
+            for i, n in enumerate(ns):
+                nn = dict(n)
+                nn["name"] = base_name if i == 0 else f"{base_name}-{i + 1}"
+                out.append(nn)
+            return out
+    return None
 
 
 def gen_proxies_lines(nodes, server):
@@ -257,6 +262,7 @@ def inject_template(template_text, nodes, server, base_name="JP-Reality", group_
 class App:
     def __init__(self, args):
         self.args = args
+        self.secret = args.secret or ""
         self.template = ""
         if args.template and os.path.exists(args.template):
             self.template = open(args.template, encoding="utf-8").read()
@@ -270,19 +276,16 @@ class App:
         if not self.server:
             log("[warn] 无法自动探测公网 IP，请用 --server 指定")
 
-    @property
-    def multi(self):
-        return bool(getattr(self.args, "secret", ""))
-
     def render(self, token):
         nodes = load_nodes(self.args.conf_dir, self.args.xray_bin, self.args.name)
         if not nodes:
             raise RuntimeError("未从 Xray 配置中找到可用的 Reality 节点")
-        sel = select_nodes(nodes, getattr(self.args, "secret", ""), token, self.args.name)
+        sel = select_nodes(nodes, self.secret, token, self.args.name)
         if sel is None:
             return None
         if self.template:
-            return inject_template(self.template, sel, self.server, self.args.name, getattr(self.args, "group_name", ""))
+            return inject_template(self.template, sel, self.server, self.args.name,
+                                   getattr(self.args, "group_name", ""))
         return gen_profile(sel, self.server)
 
 
@@ -297,23 +300,19 @@ def extract_token(handler, path):
     p = u.path.strip("/")
     if p.endswith(".yaml"):
         p = p[:-5]
-    if p.startswith("sub/"):
-        p = p[4:]
-    if p.startswith("clash/"):
-        p = p[6:]
+    for pre in ("sub/", "clash/"):
+        if p.startswith(pre):
+            p = p[len(pre):]
     return p
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "xray-sub/1.2"
+    server_version = "xray-sub/1.3"
 
     def do_GET(self):
         u = urlparse(self.path)
         p = u.path.rstrip("/")
         token = extract_token(self, p)
-        if not APP.multi and not hmac.compare_digest(token or "", APP.args.token or ""):
-            self.send_error(404, "not found")
-            return
         try:
             body = APP.render(token)
         except Exception as e:
@@ -330,7 +329,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/yaml; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(fname, safe=""))
-        self.send_header("Profile-Title", name_hint)
         self.send_header("Profile-Update-Interval", "12")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -348,6 +346,7 @@ def common_args(p):
     p.add_argument("--group-name", default="", help="替换模板里的策略组名 XQ-Network")
     p.add_argument("--template", default="")
     p.add_argument("--server", default="")
+    p.add_argument("--secret", default="")
 
 
 def url_base(args):
@@ -359,21 +358,19 @@ def url_base(args):
 def cmd_serve(args):
     global APP
     fill_defaults(args)
-    if not args.secret and not args.token:
+    if not args.secret:
         args.secret = secrets.token_hex(16)
-        log("[i] 未指定凭据，自动生成临时 secret（建议用 xray-sub init 持久化）")
+        log("[i] 未指定 secret，自动生成临时 secret（建议用 xray-sub init 持久化）")
     APP = App(args)
     try:
-        if args.secret:
-            emails = list(group_by_email(load_nodes(args.conf_dir, args.xray_bin, args.name)))
-            if not emails:
-                log("[x] 没有找到任何用户")
-                sys.exit(1)
-            sample = APP.render(token_for(args.secret, emails[0]))
-        else:
-            sample = APP.render(args.token or "")
+        nodes = load_nodes(args.conf_dir, args.xray_bin, args.name)
+        emails = list(group_by_email(nodes))
+        if not emails:
+            log("[x] 没有找到任何用户")
+            sys.exit(1)
+        sample = APP.render(token_for(args.secret, emails[0]))
         if sample is None:
-            log("[x] 启动校验失败: token 不匹配")
+            log("[x] 启动校验失败")
             sys.exit(1)
         log(f"[+] 启动校验通过，订阅大小 {len(sample)} 字节")
     except Exception as e:
@@ -393,23 +390,6 @@ def cmd_serve(args):
         log("[+] 已停止")
 
 
-def cmd_list(args):
-    fill_defaults(args)
-    nodes = load_nodes(args.conf_dir, args.xray_bin, args.name)
-    if not nodes:
-        log("[x] 没有找到可用节点")
-        sys.exit(1)
-    base = url_base(args)
-    if args.secret:
-        for email in sorted(group_by_email(nodes)):
-            print(f"{email}\t{base}/sub?token={token_for(args.secret, email)}")
-    else:
-        if not args.token:
-            log("[x] 单用户模式需要 --token")
-            sys.exit(1)
-        print(f"all\t{base}/sub?token={args.token}")
-
-
 def cmd_init(args):
     if os.geteuid() != 0:
         log("[x] init 需要 root 权限")
@@ -421,12 +401,8 @@ def cmd_init(args):
         log(f"[x] 找不到可执行的 xray: {args.xray_bin}")
         sys.exit(1)
 
-    # 复用已有凭据，避免重复 init 后订阅地址变化
     d = service_defaults()
-    secret = args.secret or d.get("secret", "")
-    token = args.token or d.get("token", "")
-    if not token and not secret:
-        secret = secrets.token_hex(16)   # 默认多用户：按 Xray client 分发 token
+    secret = args.secret or d.get("secret", "") or secrets.token_hex(16)
 
     tmpl = args.template or os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.yaml")
     if not os.path.exists(tmpl):
@@ -436,17 +412,13 @@ def cmd_init(args):
     script = os.path.abspath(__file__)
     parts = [exe, script, "serve",
              "--conf-dir", args.conf_dir, "--xray-bin", args.xray_bin,
-             "--port", str(args.port), "--name", args.name]
+             "--port", str(args.port), "--name", args.name, "--secret", secret]
     if args.server:
         parts += ["--server", args.server]
-    if getattr(args, "group_name", ""):
+    if args.group_name:
         parts += ["--group-name", args.group_name]
     if tmpl:
         parts += ["--template", tmpl]
-    if secret:
-        parts += ["--secret", secret]
-    else:
-        parts += ["--token", token]
 
     unit = ("[Unit]\nDescription=Xray Subscription Server\nAfter=network.target\n\n"
             "[Service]\n"
@@ -463,26 +435,34 @@ def cmd_init(args):
         log("[x] 启动失败，用 journalctl -u xray-sub -n 30 查看")
         sys.exit(1)
     log("[+] 服务已启动")
-
     args.secret = secret
-    args.token = token
     args.server = args.server or detect_public_ip()
     log("[+] 订阅链接：")
     cmd_list(args)
 
 
-def _reality_files(conf_dir):
-    out = []
-    for f in sorted(glob.glob(os.path.join(conf_dir, "*.json"))):
-        try:
-            d = json.load(open(f, encoding="utf-8"))
-        except Exception:
-            continue
-        for ib in d.get("inbounds", []) or []:
-            if ib.get("protocol") == "vless" and (ib.get("streamSettings") or {}).get("security") == "reality":
-                out.append(f)
-                break
-    return out
+def cmd_list(args):
+    fill_defaults(args)
+    if not args.secret:
+        log("[x] 没有 secret，请先 xray-sub init")
+        sys.exit(1)
+    nodes = load_nodes(args.conf_dir, args.xray_bin, args.name)
+    if not nodes:
+        log("[x] 没有找到可用节点")
+        sys.exit(1)
+    base = url_base(args)
+    for email in sorted(group_by_email(nodes)):
+        print(f"{email}\t{base}/sub?token={token_for(args.secret, email)}")
+
+
+def _load_cfg(f):
+    with open(f, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _save_cfg(f, d):
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=4)
 
 
 def cmd_add_user(args):
@@ -497,7 +477,7 @@ def cmd_add_user(args):
         log("[x] 没找到 vless-reality 配置")
         sys.exit(1)
     f = args.file or files[0]
-    d = json.load(open(f, encoding="utf-8"))
+    d = _load_cfg(f)
     added = False
     for ib in d.get("inbounds", []) or []:
         if ib.get("protocol") != "vless":
@@ -507,14 +487,13 @@ def cmd_add_user(args):
             log(f"[x] 用户已存在: {args.email}")
             sys.exit(1)
         uuid = subprocess.run([args.xray_bin, "uuid"], capture_output=True, text=True).stdout.strip()
-        cl.append({"id": uuid, "flow": "xtls-rprx-vision", "email": args.email})
+        cl.append({"id": uuid, "flow": "xtls-rprx-vision", "email": args.email, "level": 0})
         added = True
         break
     if not added:
         log("[x] 配置里没有可写的 vless inbound")
         sys.exit(1)
-    with open(f, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, ensure_ascii=False, indent=4)
+    _save_cfg(f, d)
     log(f"[+] 已添加 {args.email} -> {f}")
     if not args.no_restart:
         subprocess.run(["systemctl", "restart", "xray"])
@@ -539,7 +518,7 @@ def cmd_del_user(args):
         log("[x] 没找到 vless-reality 配置")
         sys.exit(1)
     f = args.file or files[0]
-    d = json.load(open(f, encoding="utf-8"))
+    d = _load_cfg(f)
     removed = False
     for ib in d.get("inbounds", []) or []:
         if ib.get("protocol") != "vless":
@@ -553,8 +532,7 @@ def cmd_del_user(args):
     if not removed:
         log(f"[x] 没找到用户: {args.email}")
         sys.exit(1)
-    with open(f, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, ensure_ascii=False, indent=4)
+    _save_cfg(f, d)
     log(f"[+] 已删除 {args.email}（其订阅 token 立即失效）")
     if not args.no_restart:
         subprocess.run(["systemctl", "restart", "xray"])
@@ -587,26 +565,24 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "init", "list", "add-user", "del-user", "update", "version", "-h", "--help"):
         sys.argv.insert(1, "serve")  # 兼容旧的无子命令用法
 
-    ap = argparse.ArgumentParser(prog="xray-sub-server", description="Xray Reality -> Clash 订阅服务")
+    ap = argparse.ArgumentParser(prog="xray-sub-server", description="按 Xray 用户分发 Clash 订阅")
     sub = ap.add_subparsers(dest="cmd")
 
     sp = sub.add_parser("serve", help="启动订阅服务")
     common_args(sp)
-    sp.add_argument("--token"); sp.add_argument("--secret")
     sp.add_argument("--listen", default="0.0.0.0"); sp.add_argument("--port", type=int, default=8081)
     sp.add_argument("--tls-cert", default=""); sp.add_argument("--tls-key", default="")
     sp.set_defaults(func=cmd_serve)
 
-    ip = sub.add_parser("init", help="注册 systemd、启动并打印订阅链接")
+    ip = sub.add_parser("init", help="注册 systemd、启动并打印每个用户链接")
     common_args(ip)
-    ip.add_argument("--token"); ip.add_argument("--secret"); ip.add_argument("--port", type=int, default=8081)
+    ip.add_argument("--port", type=int, default=8081)
     ip.set_defaults(func=cmd_init)
 
-    au = sub.add_parser("add-user", help="在 Xray 配置里新增用户并打印其订阅链接")
+    au = sub.add_parser("add-user", help="新增用户并打印其订阅链接")
     common_args(au)
     au.add_argument("--email", required=True)
     au.add_argument("--file", default="")
-    au.add_argument("--secret", default="")
     au.add_argument("--port", type=int, default=8081)
     au.add_argument("--no-restart", action="store_true")
     au.set_defaults(func=cmd_add_user)
@@ -618,9 +594,9 @@ def main():
     du.add_argument("--no-restart", action="store_true")
     du.set_defaults(func=cmd_del_user)
 
-    lp = sub.add_parser("list", help="列出订阅链接")
+    lp = sub.add_parser("list", help="列出每个用户的订阅链接")
     common_args(lp)
-    lp.add_argument("--token"); lp.add_argument("--secret"); lp.add_argument("--port", type=int, default=8081)
+    lp.add_argument("--port", type=int, default=8081)
     lp.set_defaults(func=cmd_list)
 
     up = sub.add_parser("update", help="拉取最新程序与模板并重启")
