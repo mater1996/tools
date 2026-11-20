@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 VERSION = "1.2.0"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
@@ -325,11 +325,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         data = body.encode("utf-8")
         name_hint = APP.profile_title or getattr(APP.args, "group_name", "") or APP.args.name or "xray-sub"
-        if not all(ord(c) < 128 for c in name_hint):   # 响应头只放 ASCII
-            name_hint = "xray-sub"
+        fname = name_hint if name_hint.endswith(".yaml") else name_hint + ".yaml"
         self.send_response(200)
         self.send_header("Content-Type", "text/yaml; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(fname, safe=""))
         self.send_header("Profile-Title", name_hint)
         self.send_header("Profile-Update-Interval", "12")
         self.send_header("Cache-Control", "no-store")
