@@ -517,15 +517,25 @@ def cmd_init(args):
 def cmd_list(args):
     fill_defaults(args)
     users = load_users()
-    if not users:
-        log("[i] 还没有用户。用 xray-sub add-user --email xxx")
+    umeta = {e: v for e, v in users.items() if e != "_meta"}
+    try:
+        xray_emails = set(group_by_email(load_nodes(args.conf_dir, args.xray_bin, args.name)))
+    except Exception:
+        xray_emails = set()
+    all_emails = sorted(xray_emails | set(umeta))
+    if not all_emails:
+        log("[i] Xray 和 users.json 里都没有用户")
         return
-    base = url_base(args)
-    for email in sorted(users):
-        if email == "_meta":
-            continue
-        for ln in users[email].get("links", []) or []:
-            print(f"{email}\t{sub_url(args, ln['token'])}")
+    for email in all_emails:
+        u = umeta.get(email, {})
+        links = u.get("links", []) or []
+        quota = u.get("quota_gb", 0) or 0
+        if links:
+            for ln in links:
+                print(f"{email}\t{sub_url(args, ln['token'])}\tquota={quota}GB")
+        else:
+            tag = "" if email in xray_emails else " [不在Xray]"
+            print(f"{email}\t(未纳管{tag}，运行: xray-sub add-sub --email {email})")
 
 
 def _write_link(args, email, ln):
@@ -583,7 +593,7 @@ def cmd_add_link(args):
     u = get_user(users, args.email)
     links = u.setdefault("links", [])
     if len(links) >= MAX_LINKS:
-        log(f"[x] {args.email} 已有 {len(links)} 个链接（上限 {MAX_LINKS}），先 del-link 删一个")
+        log(f"[x] {args.email} 已有 {len(links)} 个链接（上限 {MAX_LINKS}），先 del-sub 删一个")
         sys.exit(1)
     ln = new_link()
     links.append(ln)
@@ -701,7 +711,7 @@ def cmd_update(args):
 
 
 def main():
-    names = ("serve", "init", "list", "add-user", "add-link", "del-link", "set-user",
+    names = ("serve", "init", "list", "add-user", "add-sub", "add-link", "del-sub", "del-link", "set-user",
              "set-total", "del-user", "update", "version", "-h", "--help")
     if len(sys.argv) > 1 and sys.argv[1] not in names:
         sys.argv.insert(1, "serve")
@@ -725,10 +735,10 @@ def main():
     au.add_argument("--expire", default="")
     au.set_defaults(func=cmd_add_user)
 
-    al = sub.add_parser("add-link"); common_args(al); al.add_argument("--email", required=True)
+    al = sub.add_parser("add-sub", aliases=["add-link"], help="给账号新增一条订阅链接"); common_args(al); al.add_argument("--email", required=True)
     al.set_defaults(func=cmd_add_link)
 
-    dl = sub.add_parser("del-link"); dl.add_argument("--token", required=True)
+    dl = sub.add_parser("del-sub", aliases=["del-link"], help="删除一条订阅链接"); dl.add_argument("--token", required=True)
     dl.set_defaults(func=cmd_del_link)
 
     su = sub.add_parser("set-user"); su.add_argument("--email", required=True)
