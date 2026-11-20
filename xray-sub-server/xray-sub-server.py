@@ -379,6 +379,10 @@ class Handler(BaseHTTPRequestHandler):
         if not email:
             self.send_error(404, "invalid token")
             return
+        exp = int((users.get(email, {}) or {}).get("expire", 0) or 0)
+        if exp and exp < time.time():
+            self.send_error(403, "subscription expired")
+            return
         ln["last_seen"] = int(time.time())
         ln["hits"] = int(ln.get("hits", 0)) + 1
         save_users(users)
@@ -718,6 +722,41 @@ def cmd_del_user(args):
         log("[+] 已重启 xray")
 
 
+def cmd_expire(args):
+    """停用已过期用户：从 Xray 配置删除其 client，节点立即连不上。"""
+    if os.geteuid() != 0:
+        log("[x] expire 需要 root")
+        sys.exit(1)
+    files = _reality_files(args.conf_dir)
+    if not files:
+        log("[x] 没找到 vless-reality 配置")
+        sys.exit(1)
+    f = files[0]
+    users = load_users()
+    now = time.time()
+    d = _load_cfg(f)
+    expired = []
+    for ib in d.get("inbounds", []) or []:
+        if ib.get("protocol") != "vless":
+            continue
+        cl = (ib.get("settings") or {}).get("clients") or []
+        new = []
+        for c in cl:
+            email = c.get("email")
+            exp = int((users.get(email, {}) or {}).get("expire", 0) or 0)
+            if exp and exp < now:
+                expired.append(email)
+            else:
+                new.append(c)
+        ib["settings"]["clients"] = new
+    if expired:
+        _save_cfg(f, d)
+        subprocess.run(["systemctl", "restart", "xray"])
+        log(f"[+] 已停用过期用户: {', '.join(expired)}（节点已断）")
+    else:
+        log("[i] 没有过期用户")
+
+
 def _load_cfg(f):
     with open(f, encoding="utf-8") as fh:
         return json.load(fh)
@@ -752,7 +791,7 @@ def cmd_update(args):
 
 def main():
     names = ("serve", "init", "status", "list", "add-user", "add-sub", "add-link", "del-sub", "del-link", "set-user",
-             "set-total", "del-user", "update", "version", "-h", "--help")
+             "set-total", "del-user", "expire", "update", "version", "-h", "--help")
     if len(sys.argv) > 1 and sys.argv[1] not in names:
         sys.argv.insert(1, "serve")
 
@@ -795,6 +834,11 @@ def main():
     du = sub.add_parser("del-user"); common_args(du); du.add_argument("--email", required=True)
     du.add_argument("--file", default=""); du.add_argument("--no-restart", action="store_true")
     du.set_defaults(func=cmd_del_user)
+
+    ex = sub.add_parser("expire", help="停用已过期用户（从 Xray 删除 client）")
+    common_args(ex)
+    ex.add_argument("--file", default="")
+    ex.set_defaults(func=cmd_expire)
 
     up = sub.add_parser("update"); up.add_argument("--repo-raw", default=DEFAULT_REPO)
     up.add_argument("--dir", default="/opt/xray-sub"); up.add_argument("--service", default="xray-sub")
