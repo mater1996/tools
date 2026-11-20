@@ -225,6 +225,7 @@ def gen_proxies_lines(nodes, server):
             '    reality-opts:',
             f'      public-key: {n["pub"]}',
             f'      short-id: "{n["sid"]}"',
+            '      support-x25519mlkem768: true',
         ]
     return lines
 
