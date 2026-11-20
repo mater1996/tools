@@ -337,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def common_args(p):
     p.add_argument("--conf-dir", default="/etc/xray/conf")
-    p.add_argument("--xray-bin", default="xray")
+    p.add_argument("--xray-bin", default="/etc/xray/bin/xray")
     p.add_argument("--name", default="JP-Reality")
     p.add_argument("--group-name", default="", help="替换模板里的策略组名 XQ-Network")
     p.add_argument("--template", default="")
