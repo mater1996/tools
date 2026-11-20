@@ -411,8 +411,16 @@ class Handler(BaseHTTPRequestHandler):
             stats = {}
         st = stats.get(email, {"up": 0, "down": 0})
         parts = [f"upload={st['up']}", f"download={st['down']}"]
-        u = load_users().get(email, {})
+        users = load_users()
+        meta = users.get("_meta", {}) or {}
+        u = users.get(email, {}) or {}
         quota = float(u.get("quota_gb", 0) or 0)
+        total = float(meta.get("total_gb", 0) or 0)
+        if total > 0 and meta.get("owner") == email:
+            # 所有者拿「总量 - 其他人已分配」的剩余
+            others = sum(float(x.get("quota_gb", 0) or 0)
+                         for e, x in users.items() if e not in ("_meta", email))
+            quota = max(0.0, total - others)
         if quota > 0:
             parts.append(f"total={int(quota * 1024 ** 3)}")
         exp = int(u.get("expire", 0) or 0)
@@ -451,7 +459,7 @@ def cmd_serve(args):
     fill_defaults(args)
     APP = App(args)
     users = load_users()
-    emails = [e for e in users if users[e].get("links")]
+    emails = [e for e in users if e != "_meta" and users[e].get("links")]
     if not emails:
         log("[x] users.json 里没有任何用户链接，先 xray-sub add-user")
         sys.exit(1)
@@ -514,6 +522,8 @@ def cmd_list(args):
         return
     base = url_base(args)
     for email in sorted(users):
+        if email == "_meta":
+            continue
         for ln in users[email].get("links", []) or []:
             print(f"{email}\t{sub_url(args, ln['token'])}")
 
@@ -613,6 +623,17 @@ def cmd_set_user(args):
     log(f"[+] {args.email}: quota={u.get('quota_gb')}GB expire={u.get('expire')}")
 
 
+def cmd_set_total(args):
+    users = load_users()
+    meta = users.setdefault("_meta", {})
+    if args.total_gb is not None:
+        meta["total_gb"] = args.total_gb
+    if args.owner:
+        meta["owner"] = args.owner
+    save_users(users)
+    log(f"[+] 总量池: total={meta.get('total_gb')}GB owner={meta.get('owner')}")
+
+
 def cmd_del_user(args):
     if os.geteuid() != 0:
         log("[x] del-user 需要 root")
@@ -681,7 +702,7 @@ def cmd_update(args):
 
 def main():
     names = ("serve", "init", "list", "add-user", "add-link", "del-link", "set-user",
-             "del-user", "update", "version", "-h", "--help")
+             "set-total", "del-user", "update", "version", "-h", "--help")
     if len(sys.argv) > 1 and sys.argv[1] not in names:
         sys.argv.insert(1, "serve")
 
@@ -714,6 +735,11 @@ def main():
     su.add_argument("--quota-gb", type=float, default=None); su.add_argument("--expire-days", type=int, default=0)
     su.add_argument("--expire", default=""); su.add_argument("--clear", action="store_true")
     su.set_defaults(func=cmd_set_user)
+
+    stt = sub.add_parser("set-total", help="设置整机总量池与所有者")
+    stt.add_argument("--total-gb", type=float, default=None)
+    stt.add_argument("--owner", default="")
+    stt.set_defaults(func=cmd_set_total)
 
     du = sub.add_parser("del-user"); common_args(du); du.add_argument("--email", required=True)
     du.add_argument("--file", default=""); du.add_argument("--no-restart", action="store_true")
