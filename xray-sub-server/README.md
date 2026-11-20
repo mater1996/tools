@@ -8,7 +8,6 @@
 - **自动算公钥**：由 `privateKey` 调 `xray x25519` 推 `publicKey`
 - **可套模板**：用自带 `template.yaml`（已脱敏），保留策略组/分流规则，只替换 `proxies`
 - **多用户**：每个 Xray client 一个独立 token（HMAC 派生，删用户自动失效）
-- **CLI**：`serve / list / update / version`
 - token 校验支持 `?token=`、`Authorization: Bearer`、路径 `/<token>.yaml`
 
 ## 安装
@@ -17,97 +16,82 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server/install.sh)
 ```
 
-默认**只安装**（写好 systemd、设为开机自启），**不立即启动**。装完自己确认后再启动：
+**只装工具，不启动。** 安装只做三件事：下载 `xray-sub-server.py` + `template.yaml`、生成全局命令 `xray-sub`。
 
-```bash
-xray-sub list                 # 先看订阅链接
-systemctl start xray-sub      # 再启动
-```
-
-想装完立即启动：`START=1 bash <(curl -fsSL .../install.sh)`。
-
-GitHub 慢用镜像：
+GitHub 慢时 install.sh 会自动回退镜像；也可手动指定：
 
 ```bash
 REPO_RAW=https://ghfast.top/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server bash <(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server/install.sh)
 ```
 
-多用户安装：
+## 初始化（注册 + 启动 + 出链接）
 
 ```bash
-SECRET=$(openssl rand -hex 16) ...install.sh   # 设置 SECRET 环境变量即启用多用户
+xray-sub init
 ```
 
-## CLI
+`init` 会：写好 systemd（开机自启）→ 启动服务 → **打印每个用户的订阅链接**。
 
-安装后会生成全局命令 **`xray-sub`**（不用再敲 python 路径）：
+- 单用户：自动生成随机 token；
+- 多用户：`xray-sub init --secret $(openssl rand -hex 16)`，每人一个独立 token。
 
-```bash
-xray-sub list      # 查看订阅链接（多用户列出每人）
-xray-sub update    # 更新程序与模板并重启
-xray-sub version   # 版本
-xray-sub serve     # 前台启动（一般由 systemd 托管，无需手动）
-```
+重复执行 `init` 会**复用已有 token/secret**，订阅地址不变。
 
-`xray-sub` 只是对同一份 Python 程序的包装。
+## 命令
 
 | 命令 | 作用 |
 |---|---|
-| `serve` | 启动订阅服务（默认） |
-| `list` | 列出订阅链接（多用户时列出每人各自的链接） |
-| `update` | 从仓库拉取最新程序与模板，并重启 systemd 服务 |
-| `version` | 版本 |
+| `xray-sub init` | 注册 systemd、启动、打印订阅链接 |
+| `xray-sub list` | 查看订阅链接（自动从已注册服务读参数） |
+| `xray-sub serve` | 前台启动（调试用） |
+| `xray-sub update` | 拉取最新程序与模板并重启服务 |
+| `xray-sub version` | 版本 |
 
-### 单用户
+## 单用户
 
 ```bash
-python3 xray-sub-server.py serve \
-  --conf-dir /etc/xray/conf --xray-bin /etc/xray/bin/xray \
-  --token YOURTOKEN --port 8081 --template /opt/xray-sub/template.yaml
+xray-sub init
+xray-sub list
 ```
 
-订阅：`http://<IP>:8081/sub?token=YOURTOKEN`
+订阅：`http://<IP>:8081/sub?token=<token>`
 
-### 多用户
+## 多用户
 
 Xray 的 `clients[]` 里每个用户建议带 `email`（没有则用 `id`）：
 
 ```bash
-python3 xray-sub-server.py serve --conf-dir /etc/xray/conf \
-  --xray-bin /etc/xray/bin/xray --secret YOURSECRET --port 8081
-
-# 查看每个人的订阅链接
-python3 xray-sub-server.py list --conf-dir /etc/xray/conf \
-  --xray-bin /etc/xray/bin/xray --secret YOURSECRET --server <IP> --port 8081
+xray-sub init --secret <随机串>
+xray-sub list
 ```
 
 - token = `HMAC-SHA256(secret, email)[:32]`，**稳定不变**
 - 每个用户的订阅**只含自己的节点**
 - **删掉该 client 后，其 token 自动失效（404）**
-- 加用户：Xray 配置里加一个 client 即可，无需改本工具
+- 加用户：Xray 配置里加一个 client，客户端下次拉订阅就有，无需改工具
 
-### 更新
+## 更新
 
 ```bash
-python3 /opt/xray-sub/xray-sub-server.py update            # 拉最新程序+模板并重启
-python3 /opt/xray-sub/xray-sub-server.py update --no-restart
+xray-sub update
 ```
 
-重跑 `install.sh` 也可以更新，且会**复用已有 token/secret**，订阅地址不变。
+或重跑 `install.sh` 后再 `xray-sub init`（复用凭据，地址不变）。
 
-## 参数
+## 参数（init / serve / list 通用）
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--conf-dir` | `/etc/xray/conf` | Xray 配置目录 |
-| `--xray-bin` | `xray` | xray 可执行文件 |
+| `--xray-bin` | `/etc/xray/bin/xray` | xray 可执行文件 |
 | `--token` | — | 单用户全局 token |
 | `--secret` | — | 多用户密钥（启用多用户） |
-| `--listen` / `--port` | `0.0.0.0` / `8081` | 监听地址/端口 |
+| `--port` | `8081` | 监听端口 |
 | `--server` | 自动探测 | 订阅里节点地址 |
 | `--name` | `JP-Reality` | 节点名，改它时模板里 `JP-Reality` 引用同步替换 |
-| `--template` | 无 | Clash 模板 YAML |
-| `--tls-cert` / `--tls-key` | 无 | 启用 HTTPS |
+| `--template` | 自带 template.yaml | Clash 模板 YAML |
+
+`serve` 另支持 `--listen`、`--tls-cert`、`--tls-key`。
 
 ## 安全
 

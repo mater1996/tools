@@ -22,21 +22,60 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import secrets
 import socket
 import ssl
 import subprocess
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 VERSION = "1.2.0"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
+SVC_PATH = "/etc/systemd/system/xray-sub.service"
 APP = None
 _pub_cache = {}
 
 
 def log(m):
     print(m, file=sys.stderr, flush=True)
+
+
+def service_defaults():
+    """从已注册的 systemd 服务里读取参数，供 list/serve 免参数复用。"""
+    d = {}
+    if not os.path.exists(SVC_PATH):
+        return d
+    try:
+        for line in open(SVC_PATH, encoding="utf-8", errors="ignore"):
+            if line.startswith("ExecStart="):
+                toks = line.split()
+                for i, t in enumerate(toks[:-1]):
+                    if t.startswith("--"):
+                        d[t[2:]] = toks[i + 1]
+                break
+    except Exception:
+        pass
+    return d
+
+
+def fill_defaults(args):
+    d = service_defaults()
+    for k, v in d.items():
+        attr = k.replace("-", "_")
+        if not hasattr(args, attr):
+            continue
+        cur = getattr(args, attr)
+        if k == "port":
+            if cur in (None, 8081):
+                try:
+                    setattr(args, "port", int(v))
+                except Exception:
+                    pass
+        elif cur in (None, ""):
+            setattr(args, attr, v)
 
 
 def detect_public_ip():
@@ -185,7 +224,7 @@ def gen_profile(nodes, server):
     return "\n".join(y) + "\n"
 
 
-def inject_template(template_text, nodes, server, base_name="JP-Reality"):
+def inject_template(template_text, nodes, server, base_name="JP-Reality", group_name=""):
     proxies = gen_proxies_lines(nodes, server)
     lines = template_text.splitlines()
     out, i, injected = [], 0, False
@@ -210,6 +249,8 @@ def inject_template(template_text, nodes, server, base_name="JP-Reality"):
     result = "\n".join(out) + "\n"
     if base_name != "JP-Reality":
         result = result.replace("JP-Reality", base_name)
+    if group_name and group_name != "XQ-Network":
+        result = result.replace("XQ-Network", group_name)
     return result
 
 
@@ -236,7 +277,7 @@ class App:
         if sel is None:
             return None
         if self.template:
-            return inject_template(self.template, sel, self.server, self.args.name)
+            return inject_template(self.template, sel, self.server, self.args.name, getattr(self.args, "group_name", ""))
         return gen_profile(sel, self.server)
 
 
@@ -298,6 +339,7 @@ def common_args(p):
     p.add_argument("--conf-dir", default="/etc/xray/conf")
     p.add_argument("--xray-bin", default="xray")
     p.add_argument("--name", default="JP-Reality")
+    p.add_argument("--group-name", default="", help="替换模板里的策略组名 XQ-Network")
     p.add_argument("--template", default="")
     p.add_argument("--server", default="")
 
@@ -310,6 +352,7 @@ def url_base(args):
 
 def cmd_serve(args):
     global APP
+    fill_defaults(args)
     if not args.secret and not args.token:
         log("[x] 单用户模式需要 --token，或多用户模式用 --secret")
         sys.exit(1)
@@ -345,6 +388,7 @@ def cmd_serve(args):
 
 
 def cmd_list(args):
+    fill_defaults(args)
     nodes = load_nodes(args.conf_dir, args.xray_bin, args.name)
     if not nodes:
         log("[x] 没有找到可用节点")
@@ -358,6 +402,67 @@ def cmd_list(args):
             log("[x] 单用户模式需要 --token")
             sys.exit(1)
         print(f"all\t{base}/sub?token={args.token}")
+
+
+def cmd_init(args):
+    if os.geteuid() != 0:
+        log("[x] init 需要 root 权限")
+        sys.exit(1)
+    if not os.path.isdir(args.conf_dir):
+        log(f"[x] 配置目录不存在: {args.conf_dir}")
+        sys.exit(1)
+    if not (os.path.isfile(args.xray_bin) and os.access(args.xray_bin, os.X_OK)):
+        log(f"[x] 找不到可执行的 xray: {args.xray_bin}")
+        sys.exit(1)
+
+    # 复用已有凭据，避免重复 init 后订阅地址变化
+    d = service_defaults()
+    secret = args.secret or d.get("secret", "")
+    token = args.token or d.get("token", "")
+    if not secret and not token:
+        token = secrets.token_hex(16)
+
+    tmpl = args.template or os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.yaml")
+    if not os.path.exists(tmpl):
+        tmpl = ""
+
+    exe = sys.executable or "/usr/bin/python3"
+    script = os.path.abspath(__file__)
+    parts = [exe, script, "serve",
+             "--conf-dir", args.conf_dir, "--xray-bin", args.xray_bin,
+             "--port", str(args.port), "--name", args.name]
+    if args.server:
+        parts += ["--server", args.server]
+    if getattr(args, "group_name", ""):
+        parts += ["--group-name", args.group_name]
+    if tmpl:
+        parts += ["--template", tmpl]
+    if secret:
+        parts += ["--secret", secret]
+    else:
+        parts += ["--token", token]
+
+    unit = ("[Unit]\nDescription=Xray Subscription Server\nAfter=network.target\n\n"
+            "[Service]\n"
+            f"ExecStart={' '.join(parts)}\n"
+            "Restart=always\nRestartSec=3\n\n"
+            "[Install]\nWantedBy=multi-user.target\n")
+    with open(SVC_PATH, "w", encoding="utf-8") as f:
+        f.write(unit)
+    log(f"[+] 已写入 {SVC_PATH}")
+    subprocess.run(["systemctl", "daemon-reload"])
+    subprocess.run(["systemctl", "enable", "--now", "xray-sub"])
+    time.sleep(1)
+    if subprocess.run(["systemctl", "is-active", "--quiet", "xray-sub"]).returncode != 0:
+        log("[x] 启动失败，用 journalctl -u xray-sub -n 30 查看")
+        sys.exit(1)
+    log("[+] 服务已启动")
+
+    args.secret = secret
+    args.token = token
+    args.server = args.server or detect_public_ip()
+    log("[+] 订阅链接：")
+    cmd_list(args)
 
 
 def cmd_update(args):
@@ -378,7 +483,7 @@ def cmd_update(args):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "list", "update", "version", "-h", "--help"):
+    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "init", "list", "update", "version", "-h", "--help"):
         sys.argv.insert(1, "serve")  # 兼容旧的无子命令用法
 
     ap = argparse.ArgumentParser(prog="xray-sub-server", description="Xray Reality -> Clash 订阅服务")
@@ -390,6 +495,11 @@ def main():
     sp.add_argument("--listen", default="0.0.0.0"); sp.add_argument("--port", type=int, default=8081)
     sp.add_argument("--tls-cert", default=""); sp.add_argument("--tls-key", default="")
     sp.set_defaults(func=cmd_serve)
+
+    ip = sub.add_parser("init", help="注册 systemd、启动并打印订阅链接")
+    common_args(ip)
+    ip.add_argument("--token"); ip.add_argument("--secret"); ip.add_argument("--port", type=int, default=8081)
+    ip.set_defaults(func=cmd_init)
 
     lp = sub.add_parser("list", help="列出订阅链接")
     common_args(lp)
