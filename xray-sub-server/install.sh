@@ -71,11 +71,25 @@ if ! systemctl is-active --quiet xray-sub; then
 fi
 
 IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"
+
+# 生成全局命令 xray-sub
+if [ -n "$SECRET" ]; then EXTRA="--secret $SECRET"; else EXTRA="--token $TOKEN"; fi
+cat > /usr/local/bin/xray-sub <<WRAP
+#!/usr/bin/env bash
+PY="$DIR/xray-sub-server.py"
+COMMON="--conf-dir $CONF_DIR --xray-bin $XRAY_BIN --port $PORT --server ${IP:-} $EXTRA"
+cmd="\${1:-serve}"
+case "\$cmd" in
+  update|version) exec /usr/bin/python3 "\$PY" "\$@" ;;
+  *) exec /usr/bin/python3 "\$PY" "\$cmd" \$COMMON "\${@:2}" ;;
+esac
+WRAP
+chmod +x /usr/local/bin/xray-sub
+
 echo
-echo "✅ 安装完成"
+echo "✅ 安装完成（全局命令: xray-sub）"
 if [ -n "$SECRET" ]; then
-  echo "   多用户模式：查看每人订阅链接执行"
-  echo "   python3 $DIR/xray-sub-server.py list --conf-dir $CONF_DIR --xray-bin $XRAY_BIN --secret $SECRET --port $PORT --server ${IP:-<公网IP>}"
+  echo "   多用户模式：xray-sub list  查看每人订阅链接"
 else
   echo "   订阅地址: http://${IP:-<你的公网IP>}:$PORT/sub?token=$TOKEN"
 fi

@@ -31,6 +31,17 @@ SECRET=$(openssl rand -hex 16) ...install.sh   # 设置 SECRET 环境变量即�
 
 ## CLI
 
+安装后会生成全局命令 **`xray-sub`**（不用再敲 python 路径）：
+
+```bash
+xray-sub list      # 查看订阅链接（多用户列出每人）
+xray-sub update    # 更新程序与模板并重启
+xray-sub version   # 版本
+xray-sub serve     # 前台启动（一般由 systemd 托管，无需手动）
+```
+
+`xray-sub` 只是对同一份 Python 程序的包装。
+
 | 命令 | 作用 |
 |---|---|
 | `serve` | 启动订阅服务（默认） |
