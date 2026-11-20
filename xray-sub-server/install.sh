@@ -52,6 +52,8 @@ fi
 
 # 复用已有 token/secret，避免重装后订阅地址失效
 SVC=/etc/systemd/system/xray-sub.service
+FIRST_INSTALL=0
+[ -f "$SVC" ] || FIRST_INSTALL=1
 SECRET="${SECRET:-}"
 TOKEN=""
 if [ -f "$SVC" ]; then
@@ -84,11 +86,16 @@ EOF
 
 systemctl daemon-reload
 systemctl enable xray-sub >/dev/null 2>&1
-systemctl restart xray-sub   # 重装时确保新代码/新模板生效
-sleep 1
-if ! systemctl is-active --quiet xray-sub; then
-  echo "[x] 启动失败，用 journalctl -u xray-sub -n 30 查看"
-  exit 1
+if [ "$FIRST_INSTALL" = "1" ] && [ "${START:-0}" != "1" ]; then
+  echo "[i] 已安装（开机自启），但未立即启动。启动: systemctl start xray-sub"
+else
+  systemctl restart xray-sub   # 首次带 START=1 或重装时重启生效
+  sleep 1
+  if ! systemctl is-active --quiet xray-sub; then
+    echo "[x] 启动失败，用 journalctl -u xray-sub -n 30 查看"
+    exit 1
+  fi
+  echo "[+] 服务已启动"
 fi
 
 IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"

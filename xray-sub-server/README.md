@@ -17,6 +17,15 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server/install.sh)
 ```
 
+默认**只安装**（写好 systemd、设为开机自启），**不立即启动**。装完自己确认后再启动：
+
+```bash
+xray-sub list                 # 先看订阅链接
+systemctl start xray-sub      # 再启动
+```
+
+想装完立即启动：`START=1 bash <(curl -fsSL .../install.sh)`。
+
 GitHub 慢用镜像：
 
 ```bash
