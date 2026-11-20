@@ -21,12 +21,33 @@ command -v python3 >/dev/null 2>&1 || { echo "[x] 需要 python3"; exit 1; }
 [ -d "$CONF_DIR" ] || { echo "[x] 找不到 Xray 配置目录: $CONF_DIR"; exit 1; }
 [ -x "$XRAY_BIN" ] || { echo "[x] 找不到 xray 可执行文件: $XRAY_BIN"; exit 1; }
 
+# 依次尝试：自定义源 -> GitHub 直连 -> 常见镜像
+fetch_to() {  # $1=相对路径  $2=输出文件
+  local rel="$1" out="$2" base
+  for base in "$REPO_RAW" \
+      "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server" \
+      "https://ghfast.top/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server" \
+      "https://gh-proxy.com/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server" \
+      "https://ghproxy.net/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"; do
+    if curl -fsSL --connect-timeout 10 --max-time 90 "$base/$rel" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+      echo "    来源: $base"
+      return 0
+    fi
+  done
+  return 1
+}
+
 echo "[+] 下载脚本与模板 ..."
 mkdir -p "$DIR"
-curl -fsSL "$REPO_RAW/xray-sub-server.py" -o "$DIR/xray-sub-server.py"
+if ! fetch_to "xray-sub-server.py" "$DIR/xray-sub-server.py"; then
+  echo "[x] 下载 xray-sub-server.py 失败：GitHub 直连和镜像都不通"
+  echo "    可手动指定镜像后重试，例如："
+  echo "    REPO_RAW=https://ghfast.top/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server bash <(curl -fsSL <...>/install.sh)"
+  exit 1
+fi
 chmod +x "$DIR/xray-sub-server.py"
 if [ "$TEMPLATE" = "$DIR/template.yaml" ]; then
-  curl -fsSL "$REPO_RAW/template.yaml" -o "$DIR/template.yaml" || echo "[!] 模板下载失败，将生成基础配置"
+  fetch_to "template.yaml" "$DIR/template.yaml" || echo "[!] 模板下载失败，将生成基础配置"
 fi
 
 # 复用已有 token/secret，避免重装后订阅地址失效
