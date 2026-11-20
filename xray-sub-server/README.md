@@ -28,8 +28,10 @@ REPO_RAW=https://ghfast.top/https://raw.githubusercontent.com/mater1996/tools/ma
 装完会打印订阅地址：
 
 ```
-http://<公网IP>:8081/<token>.yaml
+http://<公网IP>:8081/sub?token=<token>
 ```
+
+也兼容 `Authorization: Bearer <token>` 头，或路径 `/<token>.yaml`、`/sub/<token>`。
 
 把它填进 Clash Verge → 配置 → 新建 → 远程即可。
 

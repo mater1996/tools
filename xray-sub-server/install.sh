@@ -58,6 +58,6 @@ fi
 IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"
 echo
 echo "✅ 安装完成"
-echo "   订阅地址: http://${IP:-<你的公网IP>}:$PORT/$TOKEN.yaml"
+echo "   订阅地址: http://${IP:-<你的公网IP>}:$PORT/sub?token=$TOKEN"
 echo "   放行端口: 安全组加 TCP $PORT"
 echo "   改 Xray 配置后，客户端下次拉订阅自动更新，无需重启本服务"

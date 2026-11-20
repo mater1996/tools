@@ -28,6 +28,7 @@ import ssl
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 APP = None  # 全局，供 handler 访问
 _pub_cache = {}
@@ -203,9 +204,18 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "xray-sub/1.0"
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/")
+        u = urlparse(self.path)
+        path = u.path.rstrip("/")
+        q = parse_qs(u.query)
         token = APP.args.token
-        if path not in (f"/{token}.yaml", f"/sub/{token}", f"/clash/{token}"):
+        qtok = (q.get("token") or [""])[0]
+        bearer = self.headers.get("Authorization", "")
+        ok = (
+            qtok == token
+            or bearer == f"Bearer {token}"
+            or path in (f"/{token}.yaml", f"/sub/{token}", f"/clash/{token}")
+        )
+        if not ok:
             self.send_error(404, "not found")
             return
         try:
@@ -259,7 +269,7 @@ def main():
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    log(f"[+] 订阅服务已启动: {scheme}://{args.listen}:{args.port}/{args.token}.yaml")
+    log(f"[+] 订阅服务已启动: {scheme}://{APP.server}:{args.port}/sub?token={args.token}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
