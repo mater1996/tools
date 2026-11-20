@@ -378,6 +378,9 @@ class Handler(BaseHTTPRequestHandler):
         if not email:
             self.send_error(404, "invalid token")
             return
+        ln["last_seen"] = int(time.time())
+        ln["hits"] = int(ln.get("hits", 0)) + 1
+        save_users(users)
         try:
             body = APP.render_email(email)
         except Exception as e:
@@ -560,8 +563,15 @@ def cmd_status(args):
         print(f"{email}{tag}  已用 {_fmt(used)} / 额度 {qstr}")
         links = u.get("links", []) or []
         if links:
+            now = time.time()
             for ln in links:
-                print(f"    {sub_url(args, ln['token'])}")
+                seen = int(ln.get("last_seen", 0) or 0)
+                if seen:
+                    mins = int((now - seen) / 60)
+                    ago = f"{mins}分钟前" if mins < 60 else f"{mins // 60}小时前"
+                else:
+                    ago = "从未使用"
+                print(f"    {sub_url(args, ln['token'])}  [{ago}, {ln.get('hits', 0)}次]")
         else:
             print(f"    (未纳管，运行: xray-sub add-sub --email {email})")
 
