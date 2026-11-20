@@ -261,6 +261,11 @@ class App:
         if args.template and os.path.exists(args.template):
             self.template = open(args.template, encoding="utf-8").read()
             log(f"[+] 使用模板: {args.template}")
+        self.profile_title = ""
+        if self.template:
+            m = re.search(r'^profile-title:\s*["\']?(.+?)["\']?\s*$', self.template, re.M)
+            if m:
+                self.profile_title = m.group(1).strip()
         self.server = args.server or detect_public_ip()
         if not self.server:
             log("[warn] 无法自动探测公网 IP，请用 --server 指定")
@@ -319,10 +324,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "invalid token")
             return
         data = body.encode("utf-8")
-        q = parse_qs(u.query)
-        name_hint = (q.get("name") or [""])[0] or p.strip("/")
-        if not name_hint or name_hint in ("sub", "clash") or name_hint.endswith(".yaml"):
-            name_hint = "xray-sub"
+        name_hint = APP.profile_title or getattr(APP.args, "group_name", "") or APP.args.name or "xray-sub"
         if not all(ord(c) < 128 for c in name_hint):   # 响应头只放 ASCII
             name_hint = "xray-sub"
         self.send_response(200)
