@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server
-读取 Xray 的 Reality 配置(/etc/xray/conf/*.json)，生成 Clash/mihomo 订阅，
-并通过内置 HTTP(S) 服务提供。无需 nginx。
+xray-sub-server  v1.2.0
+读取 Xray 的 Reality 配置，生成 Clash/mihomo 订阅，内置 HTTP(S) 服务提供。
 
-特点:
-  - 每次请求热重载配置：改了服务端节点，客户端下次拉订阅自动更新
-  - 自动由 privateKey 计算 publicKey(调用 xray x25519，带缓存)
-  - 可选套用已有 Clash 模板(保留你的策略组/规则)，只替换 proxies 段
-  - Token 认证 + 可选 HTTPS(自签证书)
+子命令:
+  serve     启动订阅服务(默认)
+  list      列出订阅链接(多用户时可列出每个用户各自的链接)
+  update    从 GitHub 拉取最新程序与模板并重启 systemd 服务
+  version   版本
 
-用法:
-  python3 xray-sub-server.py --token 'YOUR_TOKEN' --port 8081 \
-      --conf-dir /etc/xray/conf --xray-bin /etc/xray/bin/xray \
-      --template /etc/xray/clash-template.yaml
+两种模式:
+  单用户  --token <全局token>            一个 token 拉全部节点
+  多用户  --secret <随机密钥>            每个 Xray client 一个独立 token(HMAC 派生)
 
-订阅地址:
-  http://<服务器IP>:8081/<token>.yaml
+多用户 token = HMAC-SHA256(secret, email/id)[:32]，删掉该 client 后 token 自动失效(404)。
 """
 import argparse
 import glob
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -30,16 +29,17 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-APP = None  # 全局，供 handler 访问
+VERSION = "1.2.0"
+DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
+APP = None
 _pub_cache = {}
 
 
-def log(msg):
-    print(msg, file=sys.stderr, flush=True)
+def log(m):
+    print(m, file=sys.stderr, flush=True)
 
 
 def detect_public_ip():
-    """取本机出口 IPv4（本机公网 IP 直接绑网卡时结果即公网 IP）。"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -70,7 +70,8 @@ def pubkey_from_priv(xray_bin, priv):
     return pub
 
 
-def load_nodes(conf_dir, xray_bin, base_name="JP-Reality"):
+def load_nodes(conf_dir, xray_bin, base_name):
+    """返回所有 vless-reality client 组成的节点列表(每个 client 一项)。"""
     nodes = []
     for f in sorted(glob.glob(os.path.join(conf_dir, "*.json"))):
         try:
@@ -89,27 +90,62 @@ def load_nodes(conf_dir, xray_bin, base_name="JP-Reality"):
             clients = ((ib.get("settings") or {}).get("clients")) or []
             if not clients:
                 continue
-            c = clients[0]
             port = ib.get("listen_port") or ib.get("port")
             target = rs.get("dest") or rs.get("target") or ""
             sns = rs.get("serverNames") or []
             sni = next((s for s in sns if s), "") or (target.split(":")[0] if target else "")
             sid = (rs.get("shortIds") or [""])[0]
             pub = pubkey_from_priv(xray_bin, rs.get("privateKey") or "")
-            if not (c.get("id") and pub and sni and port):
+            if not (pub and sni and port):
                 log(f"[warn] {os.path.basename(f)}: 节点字段不完整，跳过")
                 continue
-            idx = len(nodes) + 1
-            nodes.append({
-                "name": base_name if idx == 1 else f"{base_name}-{idx}",
-                "port": int(port),
-                "uuid": c.get("id"),
-                "flow": c.get("flow") or "xtls-rprx-vision",
-                "sni": sni,
-                "pub": pub,
-                "sid": sid,
-            })
+            for c in clients:
+                if not c.get("id"):
+                    continue
+                nodes.append({
+                    "email": c.get("email") or c["id"],
+                    "uuid": c["id"],
+                    "flow": c.get("flow") or "xtls-rprx-vision",
+                    "port": int(port),
+                    "sni": sni,
+                    "pub": pub,
+                    "sid": sid,
+                })
+    for i, n in enumerate(nodes):
+        n["name"] = base_name if i == 0 else f"{base_name}-{i + 1}"
     return nodes
+
+
+def token_for(secret, email):
+    return hmac.new(secret.encode(), str(email).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def group_by_email(nodes):
+    d = {}
+    for n in nodes:
+        d.setdefault(n["email"], []).append(n)
+    return d
+
+
+def select_nodes(nodes, secret, token, base_name):
+    """按 secret+token 选出该用户的节点；单用户(secret 为空)返回全部。"""
+    if not secret:
+        sel = nodes
+    else:
+        sel = None
+        for email, ns in group_by_email(nodes).items():
+            if hmac.compare_digest(token_for(secret, email), token or ""):
+                sel = ns
+                break
+        if sel is None:
+            return None
+    # 重新命名：每个订阅里都从 base_name 开始
+    out = []
+    for i, n in enumerate(sel):
+        nn = dict(n)
+        nn["name"] = base_name if i == 0 else f"{base_name}-{i + 1}"
+        out.append(nn)
+    return out
 
 
 def gen_proxies_lines(nodes, server):
@@ -150,8 +186,6 @@ def gen_profile(nodes, server):
 
 
 def inject_template(template_text, nodes, server, base_name="JP-Reality"):
-    """把模板里顶层 `proxies:` 段整体替换为新节点，其余(策略组/规则)原样保留。
-    自定义节点名时，模板里对 `JP-Reality` 的引用同步替换，避免策略组断链。"""
     proxies = gen_proxies_lines(nodes, server)
     lines = template_text.splitlines()
     out, i, injected = [], 0, False
@@ -161,7 +195,6 @@ def inject_template(template_text, nodes, server, base_name="JP-Reality"):
             out.append("proxies:")
             out.extend(proxies)
             i += 1
-            # 跳过旧的 proxies 段：缩进行、顶格列表项(- )、空行，直到下一个顶层键
             while i < len(lines):
                 t = lines[i]
                 if t.strip() == "" or t.startswith(" ") or t.startswith("- "):
@@ -191,76 +224,112 @@ class App:
         if not self.server:
             log("[warn] 无法自动探测公网 IP，请用 --server 指定")
 
-    def render(self):
+    @property
+    def multi(self):
+        return bool(getattr(self.args, "secret", ""))
+
+    def render(self, token):
         nodes = load_nodes(self.args.conf_dir, self.args.xray_bin, self.args.name)
         if not nodes:
             raise RuntimeError("未从 Xray 配置中找到可用的 Reality 节点")
+        sel = select_nodes(nodes, getattr(self.args, "secret", ""), token, self.args.name)
+        if sel is None:
+            return None
         if self.template:
-            return inject_template(self.template, nodes, self.server, self.args.name)
-        return gen_profile(nodes, self.server)
+            return inject_template(self.template, sel, self.server, self.args.name)
+        return gen_profile(sel, self.server)
+
+
+def extract_token(handler, path):
+    u = urlparse(handler.path)
+    q = parse_qs(u.query)
+    if q.get("token"):
+        return q["token"][0]
+    auth = handler.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    p = u.path.strip("/")
+    if p.endswith(".yaml"):
+        p = p[:-5]
+    if p.startswith("sub/"):
+        p = p[4:]
+    if p.startswith("clash/"):
+        p = p[6:]
+    return p
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "xray-sub/1.0"
+    server_version = "xray-sub/1.2"
 
     def do_GET(self):
         u = urlparse(self.path)
-        path = u.path.rstrip("/")
-        q = parse_qs(u.query)
-        token = APP.args.token
-        qtok = (q.get("token") or [""])[0]
-        bearer = self.headers.get("Authorization", "")
-        ok = (
-            qtok == token
-            or bearer == f"Bearer {token}"
-            or path in (f"/{token}.yaml", f"/sub/{token}", f"/clash/{token}")
-        )
-        if not ok:
+        p = u.path.rstrip("/")
+        if p not in ("", "/", "/sub", "/clash") and not p.endswith(".yaml") and not p.startswith("/sub/") and not p.startswith("/clash/"):
+            self.send_error(404, "not found")
+            return
+        token = extract_token(self, p)
+        if not APP.multi and not hmac.compare_digest(token or "", APP.args.token or ""):
             self.send_error(404, "not found")
             return
         try:
-            body = APP.render().encode("utf-8")
+            body = APP.render(token)
         except Exception as e:
             log(f"[error] {e}")
             self.send_error(503, str(e))
             return
+        if body is None:
+            self.send_error(404, "invalid token")
+            return
+        data = body.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/yaml; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(data)))
         self.send_header("Profile-Update-Interval", "12")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
-        log(f"[ok] {self.address_string()} -> subscription ({len(body)} bytes)")
+        self.wfile.write(data)
+        log(f"[ok] {self.address_string()} -> subscription ({len(data)} bytes)")
 
     def log_message(self, fmt, *args):
-        pass  # 已自定义日志
+        pass
 
 
-def main():
+def common_args(p):
+    p.add_argument("--conf-dir", default="/etc/xray/conf")
+    p.add_argument("--xray-bin", default="xray")
+    p.add_argument("--name", default="JP-Reality")
+    p.add_argument("--template", default="")
+    p.add_argument("--server", default="")
+
+
+def url_base(args):
+    scheme = "https" if getattr(args, "tls_cert", "") else "http"
+    ip = args.server or detect_public_ip() or "<公网IP>"
+    return f"{scheme}://{ip}:{getattr(args, 'port', 8081)}"
+
+
+def cmd_serve(args):
     global APP
-    ap = argparse.ArgumentParser(description="Xray Reality -> Clash 订阅服务器(无需 nginx)")
-    ap.add_argument("--conf-dir", default="/etc/xray/conf", help="Xray 配置目录")
-    ap.add_argument("--xray-bin", default="xray", help="xray 可执行文件路径")
-    ap.add_argument("--token", required=True, help="订阅访问 token(放在 URL 里)")
-    ap.add_argument("--listen", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8081)
-    ap.add_argument("--server", default="", help="订阅里的服务器地址，留空自动探测")
-    ap.add_argument("--name", default="JP-Reality", help="节点名(模板里对 JP-Reality 的引用会同步替换)")
-    ap.add_argument("--template", default="", help="可选：Clash 模板 yaml，保留其策略组/规则")
-    ap.add_argument("--tls-cert", default="", help="可选：HTTPS 证书")
-    ap.add_argument("--tls-key", default="", help="可选：HTTPS 私钥")
-    args = ap.parse_args()
-
+    if not args.secret and not args.token:
+        log("[x] 单用户模式需要 --token，或多用户模式用 --secret")
+        sys.exit(1)
     APP = App(args)
-    # 启动即校验一次，尽早暴露配置问题
     try:
-        sample = APP.render()
+        if args.secret:
+            emails = list(group_by_email(load_nodes(args.conf_dir, args.xray_bin, args.name)))
+            if not emails:
+                log("[x] 没有找到任何用户")
+                sys.exit(1)
+            sample = APP.render(token_for(args.secret, emails[0]))
+        else:
+            sample = APP.render(args.token or "")
+        if sample is None:
+            log("[x] 启动校验失败: token 不匹配")
+            sys.exit(1)
         log(f"[+] 启动校验通过，订阅大小 {len(sample)} 字节")
     except Exception as e:
         log(f"[x] 启动校验失败: {e}")
         sys.exit(1)
-
     httpd = ThreadingHTTPServer((args.listen, args.port), Handler)
     scheme = "http"
     if args.tls_cert and args.tls_key:
@@ -268,12 +337,80 @@ def main():
         ctx.load_cert_chain(args.tls_cert, args.tls_key)
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
-
-    log(f"[+] 订阅服务已启动: {scheme}://{APP.server}:{args.port}/sub?token={args.token}")
+    log(f"[+] 订阅服务已启动: {url_base(args)}/sub?token=<token>")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         log("[+] 已停止")
+
+
+def cmd_list(args):
+    nodes = load_nodes(args.conf_dir, args.xray_bin, args.name)
+    if not nodes:
+        log("[x] 没有找到可用节点")
+        sys.exit(1)
+    base = url_base(args)
+    if args.secret:
+        for email in sorted(group_by_email(nodes)):
+            print(f"{email}\t{base}/sub?token={token_for(args.secret, email)}")
+    else:
+        if not args.token:
+            log("[x] 单用户模式需要 --token")
+            sys.exit(1)
+        print(f"all\t{base}/sub?token={args.token}")
+
+
+def cmd_update(args):
+    import urllib.request
+    os.makedirs(args.dir, exist_ok=True)
+    for fn in ("xray-sub-server.py", "template.yaml"):
+        url = f"{args.repo_raw}/{fn}"
+        dst = os.path.join(args.dir, fn)
+        log(f"[+] 下载 {url}")
+        urllib.request.urlretrieve(url, dst + ".new")
+        os.replace(dst + ".new", dst)
+        log(f"[+] 已更新 {dst}")
+    if args.restart:
+        r = subprocess.run(["systemctl", "restart", args.service])
+        log(f"[+] systemctl restart {args.service} -> rc={r.returncode}")
+    else:
+        log("[i] 未自动重启；执行 systemctl restart " + args.service + " 生效")
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] not in ("serve", "list", "update", "version", "-h", "--help"):
+        sys.argv.insert(1, "serve")  # 兼容旧的无子命令用法
+
+    ap = argparse.ArgumentParser(prog="xray-sub-server", description="Xray Reality -> Clash 订阅服务")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("serve", help="启动订阅服务")
+    common_args(sp)
+    sp.add_argument("--token"); sp.add_argument("--secret")
+    sp.add_argument("--listen", default="0.0.0.0"); sp.add_argument("--port", type=int, default=8081)
+    sp.add_argument("--tls-cert", default=""); sp.add_argument("--tls-key", default="")
+    sp.set_defaults(func=cmd_serve)
+
+    lp = sub.add_parser("list", help="列出订阅链接")
+    common_args(lp)
+    lp.add_argument("--token"); lp.add_argument("--secret"); lp.add_argument("--port", type=int, default=8081)
+    lp.set_defaults(func=cmd_list)
+
+    up = sub.add_parser("update", help="拉取最新程序与模板并重启")
+    up.add_argument("--repo-raw", default=DEFAULT_REPO)
+    up.add_argument("--dir", default="/opt/xray-sub")
+    up.add_argument("--service", default="xray-sub")
+    up.add_argument("--no-restart", action="store_true")
+    up.set_defaults(func=cmd_update)
+
+    vp = sub.add_parser("version", help="显示版本")
+    vp.set_defaults(func=lambda a: print(f"xray-sub-server {VERSION}"))
+
+    args = ap.parse_args()
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return
+    args.func(args)
 
 
 if __name__ == "__main__":
