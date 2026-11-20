@@ -378,16 +378,6 @@ class Handler(BaseHTTPRequestHandler):
         if not email:
             self.send_error(404, "invalid token")
             return
-        ip = client_ip(self)
-        bound = (ln.get("ip") or "").strip()
-        if bound and bound != ip:
-            log(f"[deny] {email} 绑定 {bound}，来自 {ip}")
-            self.send_error(403, "subscription bound to another IP")
-            return
-        if not bound:
-            ln["ip"] = ip
-            save_users(users)
-            log(f"[+] {email} 首次激活，绑定 IP {ip}")
         try:
             body = APP.render_email(email)
         except Exception as e:
@@ -525,12 +515,11 @@ def cmd_list(args):
     base = url_base(args)
     for email in sorted(users):
         for ln in users[email].get("links", []) or []:
-            ip = ln.get("ip") or "(未激活)"
-            print(f"{email}\t{sub_url(args, ln['token'])}\tIP={ip}")
+            print(f"{email}\t{sub_url(args, ln['token'])}")
 
 
-def _write_link(args, email, ln, quota=None, expire=None):
-    print(f"{email}\t{sub_url(args, ln['token'])}\tIP={ln.get('ip') or '(首次拉取时绑定)'}")
+def _write_link(args, email, ln):
+    print(f"{email}\t{sub_url(args, ln['token'])}")
 
 
 def cmd_add_user(args):
@@ -576,25 +565,32 @@ def cmd_add_user(args):
     _write_link(args, args.email, ln)
 
 
+MAX_LINKS = 5
+
+
 def cmd_add_link(args):
     users = load_users()
     u = get_user(users, args.email)
+    links = u.setdefault("links", [])
+    if len(links) >= MAX_LINKS:
+        log(f"[x] {args.email} 已有 {len(links)} 个链接（上限 {MAX_LINKS}），先 del-link 删一个")
+        sys.exit(1)
     ln = new_link()
-    u.setdefault("links", []).append(ln)
+    links.append(ln)
     save_users(users)
     args.server = args.server or detect_public_ip()
     _write_link(args, args.email, ln)
 
 
-def cmd_unlink(args):
+def cmd_del_link(args):
     users = load_users()
     email, ln = find_link(users, args.token)
     if not email:
         log("[x] token 不存在")
         sys.exit(1)
-    ln["ip"] = ""
+    users[email]["links"].remove(ln)
     save_users(users)
-    log(f"[+] 已解绑 {email} 的 {args.token[:8]}...，可重新绑定新 IP")
+    log(f"[+] 已删除 {email} 的链接 {args.token[:8]}...")
 
 
 def cmd_set_user(args):
@@ -684,7 +680,7 @@ def cmd_update(args):
 
 
 def main():
-    names = ("serve", "init", "list", "add-user", "add-link", "unlink", "set-user",
+    names = ("serve", "init", "list", "add-user", "add-link", "del-link", "set-user",
              "del-user", "update", "version", "-h", "--help")
     if len(sys.argv) > 1 and sys.argv[1] not in names:
         sys.argv.insert(1, "serve")
@@ -711,8 +707,8 @@ def main():
     al = sub.add_parser("add-link"); common_args(al); al.add_argument("--email", required=True)
     al.set_defaults(func=cmd_add_link)
 
-    ul = sub.add_parser("unlink"); ul.add_argument("--token", required=True)
-    ul.set_defaults(func=cmd_unlink)
+    dl = sub.add_parser("del-link"); dl.add_argument("--token", required=True)
+    dl.set_defaults(func=cmd_del_link)
 
     su = sub.add_parser("set-user"); su.add_argument("--email", required=True)
     su.add_argument("--quota-gb", type=float, default=None); su.add_argument("--expire-days", type=int, default=0)
