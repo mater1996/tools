@@ -319,8 +319,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "invalid token")
             return
         data = body.encode("utf-8")
-        name_hint = p.strip("/")
+        q = parse_qs(u.query)
+        name_hint = (q.get("name") or [""])[0] or p.strip("/")
         if not name_hint or name_hint in ("sub", "clash") or name_hint.endswith(".yaml"):
+            name_hint = "xray-sub"
+        if not all(ord(c) < 128 for c in name_hint):   # 响应头只放 ASCII
             name_hint = "xray-sub"
         self.send_response(200)
         self.send_header("Content-Type", "text/yaml; charset=utf-8")
