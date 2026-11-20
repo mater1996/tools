@@ -569,9 +569,10 @@ def cmd_status(args):
                 if seen:
                     mins = int((now - seen) / 60)
                     ago = f"{mins}分钟前" if mins < 60 else f"{mins // 60}小时前"
+                    tail = f"最近拉取: {ago}"
                 else:
-                    ago = "从未使用"
-                print(f"    {sub_url(args, ln['token'])}  [{ago}, {ln.get('hits', 0)}次]")
+                    tail = "未拉取"
+                print(f"    {sub_url(args, ln['token'])}  ({tail})")
         else:
             print(f"    (未纳管，运行: xray-sub add-sub --email {email})")
 
