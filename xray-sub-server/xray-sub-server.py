@@ -325,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         data = body.encode("utf-8")
         name_hint = APP.profile_title or getattr(APP.args, "group_name", "") or APP.args.name or "xray-sub"
-        fname = name_hint if name_hint.endswith(".yaml") else name_hint + ".yaml"
+        fname = name_hint[:-5] if name_hint.endswith(".yaml") else name_hint
         self.send_response(200)
         self.send_header("Content-Type", "text/yaml; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -568,7 +568,12 @@ def cmd_update(args):
         url = f"{args.repo_raw}/{fn}"
         dst = os.path.join(args.dir, fn)
         log(f"[+] 下载 {url}")
-        urllib.request.urlretrieve(url, dst + ".new")
+        req = urllib.request.Request(
+            url, headers={"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "xray-sub"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        with open(dst + ".new", "wb") as fh:
+            fh.write(data)
         os.replace(dst + ".new", dst)
         log(f"[+] 已更新 {dst}")
     if not getattr(args, "no_restart", False):
