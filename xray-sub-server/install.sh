@@ -45,5 +45,4 @@ chmod +x /usr/local/bin/xray-sub
 echo
 echo "✅ 已安装（未启动）。全局命令: xray-sub"
 echo "   注册并启动:    xray-sub init"
-echo "   多用户模式:    xray-sub init --secret \$(openssl rand -hex 16)"
-echo "   之后查看链接:  xray-sub list"
+echo "   之后查看链接:  xray-sub list   # 每个 Xray 用户一条"

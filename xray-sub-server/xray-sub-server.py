@@ -354,8 +354,8 @@ def cmd_serve(args):
     global APP
     fill_defaults(args)
     if not args.secret and not args.token:
-        log("[x] 单用户模式需要 --token，或多用户模式用 --secret")
-        sys.exit(1)
+        args.secret = secrets.token_hex(16)
+        log("[i] 未指定凭据，自动生成临时 secret（建议用 xray-sub init 持久化）")
     APP = App(args)
     try:
         if args.secret:
@@ -419,8 +419,8 @@ def cmd_init(args):
     d = service_defaults()
     secret = args.secret or d.get("secret", "")
     token = args.token or d.get("token", "")
-    if not secret and not token:
-        token = secrets.token_hex(16)
+    if not token and not secret:
+        secret = secrets.token_hex(16)   # 默认多用户：按 Xray client 分发 token
 
     tmpl = args.template or os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.yaml")
     if not os.path.exists(tmpl):
