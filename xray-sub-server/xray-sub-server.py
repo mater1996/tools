@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.5.2
+xray-sub-server  v1.5.3
 按 Xray 用户分发订阅。每个用户可拥有多个订阅链接；
 链接首次被拉取时绑定来源 IP，之后只允许该 IP 刷新（防分享）。
 
@@ -41,7 +41,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
@@ -286,11 +286,11 @@ def gen_proxies_lines(nodes, server):
                 f'    password: "{n["auth"]}"',
                 '    udp: true',
             ]
-            if n.get("sni"):
-                lines += [
-                    f'    sni: {n["sni"]}',
-                    '    skip-cert-verify: true',
-                ]
+            # 233boy 生成的 hy2 用自签证书且不带 serverName，
+            # 所以 skip-cert-verify 必须无条件输出，否则客户端握手直接失败（表现为超时）
+            sni = n.get("sni") or "www.bing.com"
+            lines.append(f'    sni: {sni}')
+            lines.append('    skip-cert-verify: true')
             continue
         lines += [
             f'  - name: "{n["name"]}"',
