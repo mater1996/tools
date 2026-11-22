@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.5.1
+xray-sub-server  v1.5.2
 按 Xray 用户分发订阅。每个用户可拥有多个订阅链接；
 链接首次被拉取时绑定来源 IP，之后只允许该 IP 刷新（防分享）。
 
@@ -41,7 +41,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
@@ -1002,6 +1002,53 @@ def cmd_import(args):
     log("    如需补齐缺失凭据并统一格式，运行: xray-sub sync")
 
 
+def cmd_rename(args):
+    """修改节点名前缀：更新 users 之外的全部相关处（systemd 参数 + 模板占位）。
+
+    节点名不进 users.json，只由 serve 的 --name 决定，所以改 systemd 即可。
+    """
+    if os.geteuid() != 0:
+        log("[x] rename 需要 root")
+        sys.exit(1)
+    if not os.path.exists(SVC_PATH):
+        log(f"[x] 未找到 {SVC_PATH}，先运行 xray-sub init")
+        sys.exit(1)
+
+    old = new = None
+    lines = open(SVC_PATH, encoding="utf-8").read().splitlines()
+    out = []
+    for ln in lines:
+        if ln.startswith("ExecStart=") and "--name" in ln:
+            toks = ln.split()
+            for i, t in enumerate(toks):
+                if t == "--name" and i + 1 < len(toks):
+                    old = toks[i + 1]
+                    toks[i + 1] = args.new_name
+                    break
+            ln = " ".join(toks)
+        out.append(ln)
+
+    if old is None:
+        log("[x] ExecStart 里没有 --name 参数，无法改名")
+        sys.exit(1)
+    if old == args.new_name:
+        log(f"[i] 已经是 {args.new_name}，无需修改")
+        return
+
+    with open(SVC_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    log(f"[+] {SVC_PATH}: --name {old} -> {args.new_name}")
+
+    subprocess.run(["systemctl", "daemon-reload"])
+    r = subprocess.run(["systemctl", "restart", "xray-sub"])
+    if r.returncode != 0:
+        log("[!] 重启失败，检查 systemctl status xray-sub")
+        sys.exit(1)
+    log("[+] 已重启 xray-sub")
+    log(f"    订阅里的节点名将变为：{args.new_name} / {args.new_name}-Hy2")
+    log("    客户端更新订阅即可看到新名字（token 不变）")
+
+
 def cmd_update(args):
     import urllib.request
     os.makedirs(args.dir, exist_ok=True)
@@ -1026,7 +1073,7 @@ def cmd_update(args):
 
 def main():
     names = ("serve", "init", "status", "list", "add-user", "add-sub", "add-link", "del-sub", "del-link", "set-user",
-             "set-total", "del-user", "expire", "sync", "import", "update", "version", "-h", "--help")
+             "set-total", "del-user", "expire", "sync", "import", "rename", "update", "version", "-h", "--help")
     if len(sys.argv) > 1 and sys.argv[1] not in names:
         sys.argv.insert(1, "serve")
 
@@ -1083,6 +1130,10 @@ def main():
     im = sub.add_parser("import", help="从现有 Xray 配置导入用户到 users.json（首次接管时用）")
     common_args(im)
     im.set_defaults(func=cmd_import)
+
+    rn = sub.add_parser("rename", help="修改节点名前缀（更新 systemd 并重启）")
+    rn.add_argument("new_name", help="新的节点名前缀，如 Materonix-JP")
+    rn.set_defaults(func=cmd_rename)
 
     up = sub.add_parser("update"); up.add_argument("--repo-raw", default=DEFAULT_REPO)
     up.add_argument("--dir", default="/opt/xray-sub"); up.add_argument("--service", default="xray-sub")

@@ -49,6 +49,7 @@ xray-sub init
 | `xray-sub serve` | 前台启动（调试用） |
 | `xray-sub sync` | **把 users.json 同步到 vless clients + hy2 users** |
 | `xray-sub import` | 从现有 Xray 配置导入用户到 users.json（首次接管） |
+| `xray-sub rename <新名>` | 修改节点名前缀（更新 systemd 并重启，token 不变） |
 | `xray-sub add-user` | 新增用户（自动生成 vless_id + hy2_auth 并同步） |
 | `xray-sub del-user` | 删除用户（从两个入站一并移除） |
 | `xray-sub expire` | 停用过期用户 |
@@ -95,6 +96,18 @@ Materonix-JP-Hy2   ← hysteria2（--name + -Hy2）
 Hy2 节点会插到所有策略组的**主节点之前**。模板里 `fallback` 组按顺序选第一个可用的，所以默认走 Hy2、Reality 兜底。
 
 **节点名不能和策略组名相同。** 模板的主策略组叫 `Materonix`，节点叫 `Materonix-JP`，两者不同名——否则规则里的 `- Materonix` 会解析到节点而不是组，分流失效。
+
+### 改节点名
+
+节点名由 `serve` 的 `--name` 参数决定（写在 systemd 的 ExecStart 里），不在 `users.json` 中。改法：
+
+```bash
+xray-sub rename Materonix-JP
+```
+
+会自动改 systemd、daemon-reload、重启服务。**token 和用户凭据都不变**，客户端更新订阅即可看到新名字。
+
+不要用 `xray-sub init` 改名——`init` 会用当前默认值重写整个 unit，把 `--server`、`--group-name` 等手工参数一并覆盖。
 
 ### 流量统计
 
