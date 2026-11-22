@@ -88,11 +88,13 @@ xray-sub init
 ### 订阅里的节点命名
 
 ```
-JP-Reality       ← vless（base_name）
-JP-Reality-Hy2   ← hysteria2（base_name-Hy2）
+Materonix-JP       ← vless（--name）
+Materonix-JP-Hy2   ← hysteria2（--name + -Hy2）
 ```
 
 Hy2 节点会插到所有策略组的**主节点之前**。模板里 `fallback` 组按顺序选第一个可用的，所以默认走 Hy2、Reality 兜底。
+
+**节点名不能和策略组名相同。** 模板的主策略组叫 `Materonix`，节点叫 `Materonix-JP`，两者不同名——否则规则里的 `- Materonix` 会解析到节点而不是组，分流失效。
 
 ### 流量统计
 
@@ -152,7 +154,7 @@ xray-sub update
 | `--secret` | — | 多用户密钥（启用多用户） |
 | `--port` | `8081` | 监听端口 |
 | `--server` | 自动探测 | 订阅里节点地址 |
-| `--name` | `JP-Reality` | 节点名，改它时模板里 `JP-Reality` 引用同步替换 |
+| `--name` | `Materonix-JP` | 节点名前缀。vless 用 `<name>`，hy2 用 `<name>-Hy2`。**不要和策略组名相同** |
 | `--template` | 自带 template.yaml | Clash 模板 YAML |
 
 `serve` 另支持 `--listen`、`--tls-cert`、`--tls-key`。

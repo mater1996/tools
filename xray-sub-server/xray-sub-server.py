@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.5.0
+xray-sub-server  v1.5.1
 按 Xray 用户分发订阅。每个用户可拥有多个订阅链接；
 链接首次被拉取时绑定来源 IP，之后只允许该 IP 刷新（防分享）。
 
@@ -41,7 +41,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
@@ -188,7 +188,7 @@ def _reality_files(conf_dir):
     return [f for f in _conf_files(conf_dir) if _reality_inbounds(f)]
 
 
-def load_nodes(conf_dir, xray_bin, base_name):
+def load_nodes(conf_dir, xray_bin, base_name="Materonix-JP"):
     """读取所有配置，返回节点列表。每个节点带 proto 字段（vless / hysteria2）。"""
     nodes = []
     for f in _conf_files(conf_dir):
@@ -327,8 +327,15 @@ def gen_profile(nodes, server):
     return "\n".join(y) + "\n"
 
 
-def inject_template(template_text, nodes, server, base_name="JP-Reality", group_name=""):
+def inject_template(template_text, nodes, server, base_name="Materonix-JP", group_name=""):
+    """把节点写入模板的 proxies 段，并把策略组里对占位名的引用换成实际节点名。
+
+    模板里的策略组用 `- JP-Reality` 作为占位（脱敏后的固定写法），
+    实际渲染时替换为当前用户的所有节点，hy2 排在 vless 之前（fallback 优先走 hy2）。
+    """
     proxies = gen_proxies_lines(nodes, server)
+    node_names = [n["name"] for n in nodes]
+
     lines = template_text.splitlines()
     out, i, injected = [], 0, False
     while i < len(lines):
@@ -349,11 +356,22 @@ def inject_template(template_text, nodes, server, base_name="JP-Reality", group_
         i += 1
     if not injected:
         out += ["", "proxies:"] + proxies
-    result = "\n".join(out) + "\n"
-    if base_name != "JP-Reality":
-        result = result.replace("JP-Reality", base_name)
-    if group_name and group_name != "XQ-Network":
-        result = result.replace("XQ-Network", group_name)
+
+    # 重写策略组里的占位引用：任何 `- JP-Reality` 行展开成实际节点列表
+    pat = re.compile(r'^(\s*)- JP-Reality\s*$')
+    rewritten = []
+    for ln in out:
+        m = pat.match(ln)
+        if m:
+            indent = m.group(1)
+            for nm in node_names:
+                rewritten.append(f"{indent}- {nm}")
+        else:
+            rewritten.append(ln)
+
+    result = "\n".join(rewritten) + "\n"
+    if group_name and group_name != "Materonix":
+        result = result.replace("Materonix", group_name)
     return result
 
 
@@ -414,11 +432,8 @@ class App:
         g = group_by_email(nodes)
         if email not in g:
             return None
-        sel = []
-        for i, n in enumerate(g[email]):
-            nn = dict(n)
-            nn["name"] = self.args.name if i == 0 else f"{self.args.name}-{i + 1}"
-            sel.append(nn)
+        # load_nodes 已按协议分好名字（JP-Reality / JP-Reality-Hy2），这里直接沿用
+        sel = [dict(n) for n in g[email]]
         if self.template:
             return inject_template(self.template, sel, self.server, self.args.name,
                                    getattr(self.args, "group_name", ""))
@@ -526,7 +541,8 @@ class Handler(BaseHTTPRequestHandler):
 def common_args(p):
     p.add_argument("--conf-dir", default="/etc/xray/conf")
     p.add_argument("--xray-bin", default="/etc/xray/bin/xray")
-    p.add_argument("--name", default="JP-Reality")
+    p.add_argument("--name", default="Materonix-JP",
+                   help="节点名前缀。vless 用 <name>，hy2 用 <name>-Hy2；不要和策略组名相同")
     p.add_argument("--group-name", default="", help="替换模板里的策略组名 XQ-Network")
     p.add_argument("--template", default="")
     p.add_argument("--server", default="")
