@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.4.0
+xray-sub-server  v1.5.0
 按 Xray 用户分发订阅。每个用户可拥有多个订阅链接；
 链接首次被拉取时绑定来源 IP，之后只允许该 IP 刷新（防分享）。
 
@@ -37,10 +37,11 @@ import ssl
 import subprocess
 import sys
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
@@ -150,29 +151,54 @@ def pubkey_from_priv(xray_bin, priv):
     return pub
 
 
-def _reality_inbounds(f):
+def _conf_files(conf_dir):
+    return sorted(glob.glob(os.path.join(conf_dir, "*.json")))
+
+
+def _parse_conf(f):
+    """解析一个配置文件，返回 (路径, 完整字典, {vless:[入站], hysteria:[入站]})。
+
+    只认 vless+reality 和 hysteria 两类入站，其他协议忽略。
+    """
     try:
         with open(f, encoding="utf-8") as fh:
             d = json.load(fh)
     except Exception:
         return None
-    out = [ib for ib in (d.get("inbounds") or [])
-           if ib.get("protocol") == "vless" and (ib.get("streamSettings") or {}).get("security") == "reality"]
-    return (d, out) if out else None
+    groups = {"vless": [], "hysteria": []}
+    for ib in d.get("inbounds") or []:
+        proto = ib.get("protocol")
+        ss = ib.get("streamSettings") or {}
+        if proto == "vless" and ss.get("security") == "reality":
+            groups["vless"].append(ib)
+        elif proto == "hysteria":
+            groups["hysteria"].append(ib)
+    return (f, d, groups) if (groups["vless"] or groups["hysteria"]) else None
+
+
+def _reality_inbounds(f):
+    """兼容旧接口：只返回 vless+reality 入站。"""
+    parsed = _parse_conf(f)
+    if not parsed or not parsed[2]["vless"]:
+        return None
+    return (parsed[1], parsed[2]["vless"])
 
 
 def _reality_files(conf_dir):
-    return [f for f in sorted(glob.glob(os.path.join(conf_dir, "*.json"))) if _reality_inbounds(f)]
+    return [f for f in _conf_files(conf_dir) if _reality_inbounds(f)]
 
 
 def load_nodes(conf_dir, xray_bin, base_name):
+    """读取所有配置，返回节点列表。每个节点带 proto 字段（vless / hysteria2）。"""
     nodes = []
-    for f in _reality_files(conf_dir):
-        parsed = _reality_inbounds(f)
+    for f in _conf_files(conf_dir):
+        parsed = _parse_conf(f)
         if not parsed:
             continue
-        d, inbounds = parsed
-        for ib in inbounds:
+        _, _, groups = parsed
+
+        # ---- vless + reality ----
+        for ib in groups["vless"]:
             ss = ib.get("streamSettings") or {}
             rs = ss.get("realitySettings") or {}
             clients = ((ib.get("settings") or {}).get("clients")) or []
@@ -183,19 +209,60 @@ def load_nodes(conf_dir, xray_bin, base_name):
             sid = (rs.get("shortIds") or [""])[0]
             pub = pubkey_from_priv(xray_bin, rs.get("privateKey") or "")
             if not (pub and sni and port):
-                log(f"[warn] {os.path.basename(f)}: 字段不完整，跳过")
+                log(f"[warn] {os.path.basename(f)}: reality 字段不完整，跳过")
                 continue
             for c in clients:
                 if not c.get("id"):
                     continue
                 nodes.append({
+                    "proto": "vless",
                     "email": c.get("email") or c["id"],
                     "uuid": c["id"],
                     "flow": c.get("flow") or "xtls-rprx-vision",
                     "port": int(port), "sni": sni, "pub": pub, "sid": sid,
                 })
-    for i, n in enumerate(nodes):
-        n["name"] = base_name if i == 0 else f"{base_name}-{i + 1}"
+
+        # ---- hysteria2 ----
+        for ib in groups["hysteria"]:
+            ss = ib.get("streamSettings") or {}
+            settings = ib.get("settings") or {}
+            users = settings.get("users") or []
+            hs = ss.get("hysteriaSettings") or {}
+            global_auth = hs.get("auth") or ""
+            port = ib.get("listen_port") or ib.get("port")
+            tls = ss.get("tlsSettings") or {}
+            sni = tls.get("serverName") or ""
+            if not port:
+                log(f"[warn] {os.path.basename(f)}: hysteria 缺少端口，跳过")
+                continue
+            if not users:
+                if global_auth:
+                    log(f"[warn] {os.path.basename(f)}: hysteria 用全局 auth 而非 users[]，"
+                        f"无法按用户分发（运行 xray-sub sync 生成 users）")
+                continue
+            for u in users:
+                auth = u.get("auth") or ""
+                email = u.get("email") or ""
+                if not (auth and email):
+                    continue
+                nodes.append({
+                    "proto": "hysteria2",
+                    "email": email,
+                    "auth": auth,
+                    "port": int(port),
+                    "sni": sni,
+                })
+
+    # 命名：vless 用 base_name（多个则 -2/-3），hy2 用 base_name-Hy2（多个则 -2/-3）
+    counters = {"vless": 0, "hysteria2": 0}
+    for n in nodes:
+        proto = n["proto"]
+        idx = counters[proto]
+        counters[proto] += 1
+        if proto == "hysteria2":
+            n["name"] = f"{base_name}-Hy2" if idx == 0 else f"{base_name}-Hy2-{idx + 1}"
+        else:
+            n["name"] = base_name if idx == 0 else f"{base_name}-{idx + 1}"
     return nodes
 
 
@@ -210,6 +277,21 @@ def group_by_email(nodes):
 def gen_proxies_lines(nodes, server):
     lines = []
     for n in nodes:
+        if n.get("proto") == "hysteria2":
+            lines += [
+                f'  - name: "{n["name"]}"',
+                '    type: hysteria2',
+                f'    server: {server}',
+                f'    port: {n["port"]}',
+                f'    password: "{n["auth"]}"',
+                '    udp: true',
+            ]
+            if n.get("sni"):
+                lines += [
+                    f'    sni: {n["sni"]}',
+                    '    skip-cert-verify: true',
+                ]
+            continue
         lines += [
             f'  - name: "{n["name"]}"',
             '    type: vless',
@@ -590,29 +672,18 @@ def cmd_add_user(args):
     if os.geteuid() != 0:
         log("[x] add-user 需要 root")
         sys.exit(1)
-    files = _reality_files(args.conf_dir)
-    if not files:
-        log("[x] 没找到 vless-reality 配置")
+    if not (_reality_files(args.conf_dir) or _parse_conf_files_any(args.conf_dir)):
+        log("[x] 没找到 vless-reality 或 hysteria 配置")
         sys.exit(1)
-    f = args.file or files[0]
-    d = _load_cfg(f)
-    for ib in d.get("inbounds", []) or []:
-        if ib.get("protocol") != "vless":
-            continue
-        cl = ib.setdefault("settings", {}).setdefault("clients", [])
-        if any(c.get("email") == args.email for c in cl):
-            log(f"[x] 用户已存在: {args.email}")
-            sys.exit(1)
-        uuid = subprocess.run([args.xray_bin, "uuid"], capture_output=True, text=True).stdout.strip()
-        cl.append({"id": uuid, "flow": "xtls-rprx-vision", "email": args.email, "level": 0})
-        break
-    _save_cfg(f, d)
-    log(f"[+] 已添加 {args.email} -> {f}")
-    if not args.no_restart:
-        subprocess.run(["systemctl", "restart", "xray"])
-        log("[+] 已重启 xray")
+
     users = load_users()
+    if args.email in users and users[args.email].get("vless_id"):
+        log(f"[x] 用户已存在: {args.email}")
+        sys.exit(1)
+
     u = get_user(users, args.email)
+    u["vless_id"] = _gen_uuid(args.xray_bin)
+    u["hy2_auth"] = _gen_auth()
     if args.quota_gb:
         u["quota_gb"] = args.quota_gb
     if args.expire_days:
@@ -625,8 +696,23 @@ def cmd_add_user(args):
     ln = new_link()
     u.setdefault("links", []).append(ln)
     save_users(users)
+
+    vless_n, hy2_n, files = sync_conf_files(args.conf_dir, args.xray_bin, users)
+    log(f"[+] 已添加 {args.email} -> {', '.join(files) or '无配置'}")
+    log(f"    vless clients: {vless_n} | hysteria users: {hy2_n}")
+    if not args.no_restart:
+        subprocess.run(["systemctl", "restart", "xray"])
+        log("[+] 已重启 xray")
     args.server = args.server or detect_public_ip()
     _write_link(args, args.email, ln)
+
+
+def _parse_conf_files_any(conf_dir):
+    """只要有 vless 或 hysteria 入站就算有配置。"""
+    for f in _conf_files(conf_dir):
+        if _parse_conf(f):
+            return [f]
+    return []
 
 
 MAX_LINKS = 5
@@ -692,69 +778,40 @@ def cmd_del_user(args):
     if os.geteuid() != 0:
         log("[x] del-user 需要 root")
         sys.exit(1)
-    files = _reality_files(args.conf_dir)
-    if not files:
-        log("[x] 没找到 vless-reality 配置")
-        sys.exit(1)
-    f = args.file or files[0]
-    d = _load_cfg(f)
-    removed = False
-    for ib in d.get("inbounds", []) or []:
-        if ib.get("protocol") != "vless":
-            continue
-        cl = (ib.get("settings") or {}).get("clients") or []
-        new = [c for c in cl if c.get("email") != args.email]
-        if len(new) != len(cl):
-            ib["settings"]["clients"] = new
-            removed = True
-            break
-    if not removed:
+    users = load_users()
+    if args.email not in users:
         log(f"[x] 没找到用户: {args.email}")
         sys.exit(1)
-    _save_cfg(f, d)
-    users = load_users()
-    if args.email in users:
-        del users[args.email]
-        save_users(users)
+    del users[args.email]
+    save_users(users)
+
+    vless_n, hy2_n, files = sync_conf_files(args.conf_dir, args.xray_bin, users)
     log(f"[+] 已删除 {args.email}，其所有链接立即失效")
+    log(f"    已从 {', '.join(files) or '无配置'} 移除 | "
+        f"vless clients: {vless_n} | hysteria users: {hy2_n}")
     if not args.no_restart:
         subprocess.run(["systemctl", "restart", "xray"])
         log("[+] 已重启 xray")
 
 
 def cmd_expire(args):
-    """停用已过期用户：从 Xray 配置删除其 client，节点立即连不上。"""
+    """停用已过期用户：从 users.json 保留记录但不再写入配置，节点立即连不上。"""
     if os.geteuid() != 0:
         log("[x] expire 需要 root")
         sys.exit(1)
-    files = _reality_files(args.conf_dir)
-    if not files:
-        log("[x] 没找到 vless-reality 配置")
-        sys.exit(1)
-    f = files[0]
     users = load_users()
     now = time.time()
-    d = _load_cfg(f)
-    expired = []
-    for ib in d.get("inbounds", []) or []:
-        if ib.get("protocol") != "vless":
-            continue
-        cl = (ib.get("settings") or {}).get("clients") or []
-        new = []
-        for c in cl:
-            email = c.get("email")
-            exp = int((users.get(email, {}) or {}).get("expire", 0) or 0)
-            if exp and exp < now:
-                expired.append(email)
-            else:
-                new.append(c)
-        ib["settings"]["clients"] = new
-    if expired:
-        _save_cfg(f, d)
-        subprocess.run(["systemctl", "restart", "xray"])
-        log(f"[+] 已停用过期用户: {', '.join(expired)}（节点已断）")
-    else:
+    expired = [e for e, u in users.items()
+               if e != "_meta" and int(u.get("expire", 0) or 0) and int(u.get("expire", 0)) < now]
+    if not expired:
         log("[i] 没有过期用户")
+        return
+    vless_n, hy2_n, files = sync_conf_files(args.conf_dir, args.xray_bin, users)
+    log(f"[+] 已停用过期用户: {', '.join(expired)}（节点已断）")
+    log(f"    剩余有效 | vless clients: {vless_n} | hysteria users: {hy2_n}")
+    if not args.no_restart:
+        subprocess.run(["systemctl", "restart", "xray"])
+        log("[+] 已重启 xray")
 
 
 def _load_cfg(f):
@@ -765,6 +822,168 @@ def _load_cfg(f):
 def _save_cfg(f, d):
     with open(f, "w", encoding="utf-8") as fh:
         json.dump(d, fh, ensure_ascii=False, indent=4)
+
+
+# ---------------- 用户同步（users.json -> vless clients + hy2 users）------
+def _gen_uuid(xray_bin):
+    try:
+        u = subprocess.run([xray_bin, "uuid"], capture_output=True, text=True, timeout=5).stdout.strip()
+        if u:
+            return u
+    except Exception:
+        pass
+    return str(uuid.uuid4())
+
+
+def _gen_auth():
+    """Hy2 的 auth 可以是任意字符串，用 32 位随机 hex。"""
+    return secrets.token_hex(16)
+
+
+def ensure_credentials(users, xray_bin):
+    """给每个用户补齐 vless_id / hy2_auth。已有值保持不变，保证订阅不失效。"""
+    changed = False
+    for email, u in users.items():
+        if email == "_meta":
+            continue
+        if not u.get("vless_id"):
+            u["vless_id"] = _gen_uuid(xray_bin)
+            changed = True
+        if not u.get("hy2_auth"):
+            u["hy2_auth"] = _gen_auth()
+            changed = True
+    return changed
+
+
+def _active_users(users):
+    """未过期的用户。"""
+    now = time.time()
+    out = {}
+    for email, u in users.items():
+        if email == "_meta":
+            continue
+        exp = int(u.get("expire", 0) or 0)
+        if exp and exp < now:
+            continue
+        out[email] = u
+    return out
+
+
+def sync_conf_files(conf_dir, xray_bin, users):
+    """把 users.json 的用户写进所有 vless-reality 和 hysteria 入站。
+
+    返回 (vless 写入数, hy2 写入数, 涉及的文件列表)。
+    配置文件由本工具独占管理：clients[] / users[] 会被完全重写为当前有效用户。
+    """
+    active = _active_users(users)
+    vless_n = hy2_n = 0
+    touched = []
+    for f in _conf_files(conf_dir):
+        parsed = _parse_conf(f)
+        if not parsed:
+            continue
+        _, d, groups = parsed
+        dirty = False
+
+        for ib in groups["vless"]:
+            cl = []
+            for email, u in active.items():
+                if not u.get("vless_id"):
+                    continue
+                cl.append({
+                    "id": u["vless_id"],
+                    "flow": "xtls-rprx-vision",
+                    "email": email,
+                    "level": 0,
+                })
+            ib.setdefault("settings", {})["clients"] = cl
+            vless_n += len(cl)
+            dirty = True
+
+        for ib in groups["hysteria"]:
+            ul = []
+            for email, u in active.items():
+                if not u.get("hy2_auth"):
+                    continue
+                ul.append({"auth": u["hy2_auth"], "level": 0, "email": email})
+            ib.setdefault("settings", {})["users"] = ul
+            # users[] 存在时 hysteriaSettings.auth 会被覆盖，清掉避免误导
+            hs = (ib.get("streamSettings") or {}).get("hysteriaSettings")
+            if isinstance(hs, dict) and "auth" in hs:
+                hs.pop("auth", None)
+            hy2_n += len(ul)
+            dirty = True
+
+        if dirty:
+            _save_cfg(f, d)
+            touched.append(os.path.basename(f))
+    return vless_n, hy2_n, touched
+
+
+def cmd_sync(args):
+    """把 users.json 同步到 Xray 配置（vless clients + hy2 users）。"""
+    if os.geteuid() != 0:
+        log("[x] sync 需要 root")
+        sys.exit(1)
+    users = load_users()
+    real = {e: v for e, v in users.items() if e != "_meta"}
+    if not real:
+        log("[x] users.json 里没有用户")
+        sys.exit(1)
+    if ensure_credentials(users, args.xray_bin):
+        save_users(users)
+        log("[+] 已为缺失的用户生成 vless_id / hy2_auth")
+    vless_n, hy2_n, files = sync_conf_files(args.conf_dir, args.xray_bin, users)
+    if not files:
+        log("[x] 没找到 vless-reality 或 hysteria 配置")
+        sys.exit(1)
+    log(f"[+] 已同步到 {', '.join(files)}")
+    log(f"    vless clients: {vless_n} 条 | hysteria users: {hy2_n} 条")
+    if not args.no_restart:
+        r = subprocess.run(["systemctl", "restart", "xray"])
+        if r.returncode == 0:
+            log("[+] 已重启 xray")
+        else:
+            log("[!] xray 重启失败，检查 systemctl status xray")
+    else:
+        log("[i] 未重启；执行 systemctl restart xray 生效")
+
+
+def cmd_import(args):
+    """从现有 Xray 配置导入用户到 users.json（首次接管时用，不改配置文件）。"""
+    users = load_users()
+    found = {}
+    for f in _conf_files(args.conf_dir):
+        parsed = _parse_conf(f)
+        if not parsed:
+            continue
+        _, _, groups = parsed
+        for ib in groups["vless"]:
+            for c in ((ib.get("settings") or {}).get("clients") or []):
+                email, uid = c.get("email"), c.get("id")
+                if email and uid:
+                    found.setdefault(email, {})["vless_id"] = uid
+        for ib in groups["hysteria"]:
+            for u in ((ib.get("settings") or {}).get("users") or []):
+                email, auth = u.get("email"), u.get("auth")
+                if email and auth:
+                    found.setdefault(email, {})["hy2_auth"] = auth
+    if not found:
+        log("[i] 现有配置里没有可导入的用户")
+        return
+    added = updated = 0
+    for email, cred in found.items():
+        u = get_user(users, email)
+        for k, v in cred.items():
+            if u.get(k) != v:
+                u[k] = v
+                updated += 1
+        if not u.get("links"):
+            added += 1
+    save_users(users)
+    log(f"[+] 导入 {len(found)} 个用户（{added} 个新建，{updated} 个凭据更新）")
+    log("    users.json 已保存；配置文件未改动")
+    log("    如需补齐缺失凭据并统一格式，运行: xray-sub sync")
 
 
 def cmd_update(args):
@@ -791,7 +1010,7 @@ def cmd_update(args):
 
 def main():
     names = ("serve", "init", "status", "list", "add-user", "add-sub", "add-link", "del-sub", "del-link", "set-user",
-             "set-total", "del-user", "expire", "update", "version", "-h", "--help")
+             "set-total", "del-user", "expire", "sync", "import", "update", "version", "-h", "--help")
     if len(sys.argv) > 1 and sys.argv[1] not in names:
         sys.argv.insert(1, "serve")
 
@@ -839,6 +1058,15 @@ def main():
     common_args(ex)
     ex.add_argument("--file", default="")
     ex.set_defaults(func=cmd_expire)
+
+    sy = sub.add_parser("sync", help="把 users.json 同步到 vless clients 和 hy2 users")
+    common_args(sy)
+    sy.add_argument("--no-restart", action="store_true")
+    sy.set_defaults(func=cmd_sync)
+
+    im = sub.add_parser("import", help="从现有 Xray 配置导入用户到 users.json（首次接管时用）")
+    common_args(im)
+    im.set_defaults(func=cmd_import)
 
     up = sub.add_parser("update"); up.add_argument("--repo-raw", default=DEFAULT_REPO)
     up.add_argument("--dir", default="/opt/xray-sub"); up.add_argument("--service", default="xray-sub")

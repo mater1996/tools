@@ -1,6 +1,8 @@
 # xray-sub-server
 
-读取 Xray 的 Reality 配置（`/etc/xray/conf/*.json`），生成 Clash / mihomo 订阅，并通过**内置 HTTP(S) 服务**提供——不需要 nginx。
+读取 Xray 配置（`/etc/xray/conf/*.json`），生成 Clash / mihomo 订阅，并通过**内置 HTTP(S) 服务**提供——不需要 nginx。
+
+支持 **VLESS-REALITY** 和 **Hysteria2** 两种入站，同一用户可同时拿到两条线路的节点。
 
 ## 特性
 
@@ -8,7 +10,8 @@
 - **自动算公钥**：由 `privateKey` 调 `xray x25519` 推 `publicKey`
 - **可套模板**：用自带 `template.yaml`（已脱敏），保留策略组/分流规则，只替换 `proxies`
 - **多用户**：每个 Xray client 一个独立 token（HMAC 派生，删用户自动失效）
-- token 校验支持 `?token=`、`Authorization: Bearer`、路径 `/<token>.yaml`
+- **双协议**：`users.json` 是唯一真源，`sync` 同时写入 vless `clients[]` 和 hy2 `users[]`
+- token 校验支持 `?token=`、`Authorization: Bearer <token>`、路径 `/<token>.yaml`
 
 ## 安装
 
@@ -44,8 +47,69 @@ xray-sub init
 | `xray-sub init` | 注册 systemd、启动、打印订阅链接 |
 | `xray-sub list` | 查看订阅链接（自动从已注册服务读参数） |
 | `xray-sub serve` | 前台启动（调试用） |
+| `xray-sub sync` | **把 users.json 同步到 vless clients + hy2 users** |
+| `xray-sub import` | 从现有 Xray 配置导入用户到 users.json（首次接管） |
+| `xray-sub add-user` | 新增用户（自动生成 vless_id + hy2_auth 并同步） |
+| `xray-sub del-user` | 删除用户（从两个入站一并移除） |
+| `xray-sub expire` | 停用过期用户 |
 | `xray-sub update` | 拉取最新程序与模板并重启服务 |
 | `xray-sub version` | 版本 |
+
+## 双协议：users.json 是唯一真源
+
+每个用户在 `users.json` 里保存两套凭据：
+
+```json
+{
+  "alice@example.com": {
+    "vless_id": "550e8400-e29b-41d4-a716-446655440000",
+    "hy2_auth": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "quota_gb": 100,
+    "expire": 1797999999,
+    "links": [{"token": "...", "ip": "1.2.3.4"}]
+  }
+}
+```
+
+`xray-sub sync` 会把它写进两个地方：
+
+```json
+// vless 入站
+"clients": [{"id": "<vless_id>", "flow": "xtls-rprx-vision", "email": "...", "level": 0}]
+
+// hysteria 入站
+"users": [{"auth": "<hy2_auth>", "level": 0, "email": "..."}]
+```
+
+**密码各自独立随机**：`vless_id` 是 UUID，`hy2_auth` 是 32 位 hex。两者不需要相同，因为它们是两个独立入站的独立凭据。
+
+同时 `sync` 会**清掉 `hysteriaSettings.auth`**——Xray 在存在 `users[]` 时会忽略它，留着只会误导。
+
+### 订阅里的节点命名
+
+```
+JP-Reality       ← vless（base_name）
+JP-Reality-Hy2   ← hysteria2（base_name-Hy2）
+```
+
+Hy2 节点会插到所有策略组的**主节点之前**。模板里 `fallback` 组按顺序选第一个可用的，所以默认走 Hy2、Reality 兜底。
+
+### 流量统计
+
+两个入站都带 `email`，Xray 统一记到 `user>>>email>>>traffic>>>uplink/downlink`。现有的配额和统计逻辑不用改。
+
+## 首次接管现有配置
+
+如果 Xray 配置是 233boy 脚本生成的，先导入再同步：
+
+```bash
+xray-sub import    # 读现有配置，把 UUID/auth 存进 users.json（不改配置文件）
+xray-sub sync      # 补齐缺失凭据，重写两个入站的用户列表
+```
+
+`import` 只读不写配置，所以现有用户的 UUID 不会变，订阅继续有效。
+
+**注意**：接管后这两个配置文件由 `xray-sub` 独占管理。再用 `xray add` / `xray change` 改它们会被覆盖。
 
 ## 单用户
 
