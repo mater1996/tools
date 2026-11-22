@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.5.5
+xray-sub-server  v1.5.6
 按 Xray 用户分发订阅。每个用户可拥有多个订阅链接；
 链接首次被拉取时绑定来源 IP，之后只允许该 IP 刷新（防分享）。
 
@@ -41,7 +41,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
