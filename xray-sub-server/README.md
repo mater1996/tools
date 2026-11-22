@@ -29,6 +29,10 @@ REPO_RAW=https://ghfast.top/https://raw.githubusercontent.com/mater1996/tools/ma
 
 ## 初始化（注册 + 启动 + 出链接）
 
+> **部署 Hysteria2 前必须先放行 UDP 端口。** 云厂商安全组默认只开 TCP，
+> UDP 8443（或你选的端口）不放行的话，服务端 `ss -ulnp` 能看到监听、
+> xray 日志也正常，但客户端一律超时——这个坑很难从服务端日志看出来。
+
 ```bash
 xray-sub init
 ```
@@ -112,6 +116,23 @@ xray-sub rename Materonix-JP
 ### 流量统计
 
 两个入站都带 `email`，Xray 统一记到 `user>>>email>>>traffic>>>uplink/downlink`。现有的配额和统计逻辑不用改。
+
+## 排障：Hy2 节点超时
+
+按顺序排除，每步都能独立定位问题：
+
+| 检查 | 命令 | 说明 |
+|---|---|---|
+| **① 安全组/防火墙放行 UDP** | 云控制台 → 安全组 → 入方向 | **最常见原因**。UDP 默认不放行，服务端一切正常但客户端全超时 |
+| ② 服务端在监听 | `ss -ulnp \| grep 8443` | 有 `xray` 记录才算监听 |
+| ③ 入站已加载 | `journalctl -u xray \| grep -i hysteria` | 应出现 `appended inbound with tag` |
+| ④ 订阅含 skip-cert-verify | `curl -s "<订阅URL>" \| grep -A9 Hy2` | 自签证书缺这行 = 握手失败 |
+| ⑤ 服务端收到包 | `journalctl -u xray -f \| grep -i hysteria`，然后客户端连一次 | 完全无日志 = 包没到（回到第 ① 步） |
+
+**区分两种失败**：
+
+- `Timeout`（超时）→ 包没到，或握手无响应 → 查安全组
+- `An error occurred in the delay test`（协议错误）→ 包到了但握手失败 → 查证书、密码、版本
 
 ## 首次接管现有配置
 

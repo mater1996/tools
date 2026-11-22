@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-xray-sub-server  v1.5.3
+xray-sub-server  v1.5.5
 按 Xray 用户分发订阅。每个用户可拥有多个订阅链接；
 链接首次被拉取时绑定来源 IP，之后只允许该 IP 刷新（防分享）。
 
@@ -41,7 +41,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.5.3"
+VERSION = "1.5.5"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
@@ -1049,21 +1049,52 @@ def cmd_rename(args):
     log("    客户端更新订阅即可看到新名字（token 不变）")
 
 
-def cmd_update(args):
+def _fetch_url(url, timeout=30):
+    """下载 URL，带 cache-bust 参数绕过 raw.githubusercontent.com 的 CDN 缓存。
+
+    raw CDN 会按 URL 缓存数分钟到数小时，光加 Cache-Control 请求头没用，
+    必须改查询串才能拿到最新内容。
+    """
     import urllib.request
+    sep = "&" if "?" in url else "?"
+    bust = f"{url}{sep}_t={int(time.time())}"
+    req = urllib.request.Request(bust, headers={
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        "Pragma": "no-cache",
+        "User-Agent": "xray-sub",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def cmd_update(args):
     os.makedirs(args.dir, exist_ok=True)
     for fn in ("xray-sub-server.py", "template.yaml"):
         url = f"{args.repo_raw}/{fn}"
         dst = os.path.join(args.dir, fn)
         log(f"[+] 下载 {url}")
-        req = urllib.request.Request(
-            url, headers={"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "xray-sub"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
+        data = _fetch_url(url)
+        if not data:
+            log(f"[x] {fn} 下载为空，跳过")
+            continue
+        # 校验下载到的是 Python 脚本（防止 CDN 返回错误页）
+        if fn.endswith(".py") and b"def main()" not in data:
+            log(f"[x] {fn} 内容异常（不是完整脚本），放弃覆盖")
+            sys.exit(1)
         with open(dst + ".new", "wb") as fh:
             fh.write(data)
         os.replace(dst + ".new", dst)
-        log(f"[+] 已更新 {dst}")
+        log(f"[+] 已更新 {dst}（{len(data)} 字节）")
+
+    # 打印更新后的版本，便于确认是否真的拿到新版
+    try:
+        with open(os.path.join(args.dir, "xray-sub-server.py"), encoding="utf-8") as fh:
+            m = re.search(r'^VERSION = "([^"]+)"', fh.read(), re.M)
+        if m:
+            log(f"[+] 当前版本: {m.group(1)}")
+    except Exception:
+        pass
+
     if not getattr(args, "no_restart", False):
         r = subprocess.run(["systemctl", "restart", args.service])
         log(f"[+] systemctl restart {args.service} -> rc={r.returncode}")

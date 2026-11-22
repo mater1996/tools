@@ -8,13 +8,13 @@ dns:
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fallback:
-  - https://v.recipes/dns-cn
-  - https://doh.dns.sb/dns-query
   - https://dns.cloudflare.com/dns-query
-  - https://dns.twnic.tw/dns-query
+  - https://dns.google/dns-query
   - tls://8.8.4.4:853
+  - tls://1.1.1.1:853
   fallback-filter:
     geoip: true
+    geoip-code: CN
     ipcidr:
     - 240.0.0.0/4
     - 0.0.0.0/32

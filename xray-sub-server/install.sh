@@ -10,14 +10,22 @@ DIR="${DIR:-/opt/xray-sub}"
 command -v python3 >/dev/null 2>&1 || { echo "[x] 需要 python3"; exit 1; }
 
 # 依次尝试：自定义源 -> GitHub 直连 -> 常见镜像
+# 每个源都带 cache-bust 参数，绕过 raw.githubusercontent.com 的 CDN 缓存
 fetch_to() {  # $1=相对路径  $2=输出文件
-  local rel="$1" out="$2" base
+  local rel="$1" out="$2" base ts
+  ts=$(date +%s)
   for base in "$REPO_RAW" \
       "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server" \
       "https://ghfast.top/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server" \
       "https://gh-proxy.com/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server" \
       "https://ghproxy.net/https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"; do
-    if curl -fsSL --connect-timeout 10 --max-time 90 "$base/$rel" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+    if curl -fsSL --connect-timeout 10 --max-time 90 \
+        -H "Cache-Control: no-cache" "$base/$rel?_t=$ts" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+      # 简单完整性校验：py 必须含 def main()
+      if [[ "$rel" == *.py ]] && ! grep -q "def main()" "$out"; then
+        echo "    来源 $base 内容不完整，继续尝试"
+        continue
+      fi
       echo "    来源: $base"
       return 0
     fi
