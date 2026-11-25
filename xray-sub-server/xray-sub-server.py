@@ -41,7 +41,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.5.7"
+VERSION = "1.5.8"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
 # 手工维护的额外节点（ws / grpc 等本工具不解析的接入方式），原样追加到 proxies 段
@@ -460,6 +460,97 @@ def query_user_stats(xray_bin, api_addr="127.0.0.1:10085", ttl=60):
     return data
 
 
+# ---------------- 整机出站统计（网卡口径，持久化） ----------------
+# 目的：Xray 的用户计数存在内存里，重启即清零；订阅里显示"本月已用"应该是
+# 整机累计，且要跨重启、跨月正确。这里直接读 /proc/net/dev，落盘累加。
+USAGE_STATE = "/var/lib/xray-sub/usage.json"
+
+
+def _boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _nic_tx_bytes():
+    """整机出站字节：所有非 lo 网卡 TX 之和。读不到返回 None（非 Linux / 无权限）。"""
+    try:
+        total = 0
+        with open("/proc/net/dev") as fh:
+            for ln in fh:
+                if ":" not in ln:
+                    continue
+                name, rest = ln.split(":", 1)
+                if name.strip() == "lo":
+                    continue
+                f = rest.split()
+                if len(f) < 9:
+                    continue
+                total += int(f[8])          # TX bytes
+        return total
+    except (OSError, ValueError):
+        return None
+
+
+def _usage_state_path():
+    return os.environ.get("XRAY_SUB_USAGE") or USAGE_STATE
+
+
+def _load_usage_state():
+    p = _usage_state_path()
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_usage_state(st):
+    p = _usage_state_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(st, fh)
+        os.replace(tmp, p)
+    except OSError as e:
+        log(f"[warn] 写入用量状态失败 {p}: {e}")
+
+
+def egress_month_bytes():
+    """本月整机出站字节（跨重启累加、按自然月归零）。读不到网卡时返回 None。
+
+    状态字段：
+      offset      历次开机累计的基线（重启后把上次开机的 last_raw 并入）
+      last_raw    本次开机最后一次读到的网卡 TX
+      boot_id     用来识别重启
+      month       当前月份 "YYYY-MM"
+      month_base  本月起点对应的累计值
+    """
+    raw = _nic_tx_bytes()
+    if raw is None:
+        return None
+    st = _load_usage_state()
+    bid = _boot_id()
+    if st.get("boot_id") != bid:
+        # 重启过：上次开机累计到的量并入基线
+        st["offset"] = int(st.get("offset", 0) or 0) + int(st.get("last_raw", 0) or 0)
+        st["boot_id"] = bid
+        st["last_raw"] = raw
+    total = int(st.get("offset", 0) or 0) + raw
+    month = time.strftime("%Y-%m")
+    if st.get("month") != month:
+        st["month"] = month
+        st["month_base"] = total
+    if "month_base" not in st:
+        st["month_base"] = total
+    st["last_raw"] = raw
+    _save_usage_state(st)
+    return max(0, total - int(st["month_base"]))
+
+
 # ---------------- App / Handler ----------------
 class App:
     def __init__(self, args):
@@ -565,7 +656,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             stats = {}
         st = stats.get(email, {"up": 0, "down": 0})
-        parts = [f"upload={st['up']}", f"download={st['down']}"]
+        # 下载量优先用整机出站（网卡口径，跨重启累加）；读不到才退回 Xray 计数。
+        # 这样订阅里显示的"本月已用"不会因为重启 xray 而归零。
+        nic = egress_month_bytes()
+        down_show = nic if nic is not None else st["down"]
+        parts = [f"upload={st['up']}", f"download={down_show}"]
         users = load_users()
         meta = users.get("_meta", {}) or {}
         u = users.get(email, {}) or {}
@@ -695,10 +790,16 @@ def cmd_status(args):
     umeta = {e: v for e, v in users.items() if e != "_meta"}
     all_emails = sorted(xray_emails | set(umeta))
     used_total = sum(stats.get(e, {}).get("up", 0) + stats.get(e, {}).get("down", 0) for e in all_emails)
+    # 全局用量优先用整机出站（网卡口径，跨重启累加），与订阅里显示的口径一致
+    nic = egress_month_bytes()
+    if nic is not None:
+        used_total = nic
     if total:
-        print(f"全局: 已用 {_mb(used_total)} MB / {_gb(total)} GB | 剩余 {_gb(max(0, total - used_total))} GB")
+        print(f"全局: 已用 {_mb(used_total)} MB / {_gb(total)} GB | 剩余 {_gb(max(0, total - used_total))} GB"
+              + ("  [网卡口径]" if nic is not None else ""))
     else:
-        print(f"全局: 已用 {_mb(used_total)} MB (总量未设置)")
+        print(f"全局: 已用 {_mb(used_total)} MB (总量未设置)"
+              + ("  [网卡口径]" if nic is not None else ""))
     print("-" * 56)
     if not all_emails:
         print("(没有用户)")

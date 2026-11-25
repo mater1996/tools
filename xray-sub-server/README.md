@@ -117,6 +117,27 @@ xray-sub rename Materonix-JP
 
 两个入站都带 `email`，Xray 统一记到 `user>>>email>>>traffic>>>uplink/downlink`。现有的配额和统计逻辑不用改。
 
+**但 Xray 的用户计数存在内存里，`systemctl restart xray` 就清零**，不能当"本月已用"看。
+
+所以订阅响应头和 `list` 里的**全局用量改用整机网卡口径**：
+
+- 读 `/proc/net/dev` 所有非 lo 网卡的 TX 字节数
+- 落盘到 `/var/lib/xray-sub/usage.json`，按 `boot_id` 识别重启、跨开机累加
+- 按自然月归零（`month_base`）
+- 读不到 `/proc/net/dev`（非 Linux）时自动退回 Xray 计数，**不需要任何参数**
+
+口径差异：
+
+| 项 | 网卡口径 | 账单口径 |
+|---|---|---|
+| 层级 | 链路层（含以太网头） | IP 层 |
+| 非代理流量 | 包含（SSH、apt、DNS） | 也包含 |
+| 实测偏差 | 比实际 payload 高约 **3.4%**（TCP/IP 头） | 准 |
+
+方向是略微高估，对"别用超额度"来说更安全。要严格对齐账单，只能用结算数据导出到 BigQuery。
+
+重置统计：删掉 `/var/lib/xray-sub/usage.json` 后重启服务即可。
+
 ## 排障：Hy2 节点超时
 
 按顺序排除，每步都能独立定位问题：
