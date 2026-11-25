@@ -193,6 +193,34 @@ xray-sub update
 
 `serve` 另支持 `--listen`、`--tls-cert`、`--tls-key`。
 
+## 额外节点（ws / Cloudflare 隧道等）
+
+工具只解析 Reality 和 Hy2 入站。如果还有别的接入方式（例如 Cloudflare Tunnel 后面的
+`vless + ws` 节点），把它写进 `/etc/xray-sub/extra-proxies.yaml`，会被原样追加到订阅的
+`proxies` 段，并自动加入所有策略组。
+
+文件内容是标准的 Clash 条目，注意缩进两格：
+
+```yaml
+  - name: "Materonix-CF"
+    type: vless
+    server: node.example.com
+    port: 443
+    uuid: <与 Reality 节点相同的 UUID>
+    network: ws
+    tls: true
+    servername: node.example.com
+    ws-opts:
+      path: /ws
+      headers:
+        Host: node.example.com
+```
+
+- 文件不存在则行为与之前完全一致，不影响现有部署
+- 以 `#` 开头的行会被忽略，可用于注释
+- 可用环境变量 `XRAY_SUB_EXTRA` 覆盖路径
+- 改完直接 `systemctl restart xray-sub`，不用改代码；加更多节点也一样
+
 ## 安全
 
 - **token/secret 就是凭据**，务必用长随机串

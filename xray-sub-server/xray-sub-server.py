@@ -41,9 +41,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
 
-VERSION = "1.5.6"
+VERSION = "1.5.7"
 DEFAULT_REPO = "https://raw.githubusercontent.com/mater1996/tools/main/xray-sub-server"
 SVC_PATH = "/etc/systemd/system/xray-sub.service"
+# 手工维护的额外节点（ws / grpc 等本工具不解析的接入方式），原样追加到 proxies 段
+EXTRA_PROXIES = "/etc/xray-sub/extra-proxies.yaml"
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
 APP = None
 _pub_cache = {}
@@ -274,6 +276,49 @@ def group_by_email(nodes):
 
 
 # ---------------- 订阅生成 ----------------
+def _extra_proxy_lines():
+    """读取手工维护的额外节点，返回可直接拼接的 proxies 段行。
+
+    文件内容就是已经格式化好的 Clash 条目（每行以两个空格缩进），
+    用于 ws / grpc 等本工具不解析的接入方式。文件不存在则返回空。
+    可用环境变量 XRAY_SUB_EXTRA 覆盖路径（便于测试）。
+    """
+    path = os.environ.get("XRAY_SUB_EXTRA") or EXTRA_PROXIES
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as e:
+        log(f"[warn] 读取额外节点失败 {path}: {e}")
+        return []
+    out = []
+    for ln in raw.splitlines():
+        s = ln.rstrip()
+        if not s.strip() or s.lstrip().startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
+def _extra_proxy_names():
+    """从额外节点文件里解析节点名，供策略组引用。"""
+    path = os.environ.get("XRAY_SUB_EXTRA") or EXTRA_PROXIES
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    names = []
+    for m in re.finditer(r'^\s*-\s*name:\s*(.+?)\s*$', raw, re.M):
+        nm = m.group(1).strip().strip('"').strip("'")
+        if nm and nm not in names:
+            names.append(nm)
+    return names
+
+
 def gen_proxies_lines(nodes, server):
     lines = []
     for n in nodes:
@@ -309,6 +354,7 @@ def gen_proxies_lines(nodes, server):
             f'      short-id: "{n["sid"]}"',
             '      support-x25519mlkem768: true',
         ]
+    lines += _extra_proxy_lines()
     return lines
 
 
@@ -323,6 +369,7 @@ def gen_profile(nodes, server):
     y += gen_proxies_lines(nodes, server)
     y += ["", "proxy-groups:", '  - name: "PROXY"', "    type: select", "    proxies:"]
     y += [f'      - "{n["name"]}"' for n in nodes]
+    y += [f'      - "{nm}"' for nm in _extra_proxy_names()]
     y += ["      - DIRECT", "", "rules:", "  - GEOIP,CN,DIRECT", "  - MATCH,PROXY"]
     return "\n".join(y) + "\n"
 
@@ -335,6 +382,9 @@ def inject_template(template_text, nodes, server, base_name="Materonix-JP", grou
     """
     proxies = gen_proxies_lines(nodes, server)
     node_names = [n["name"] for n in nodes]
+    for nm in _extra_proxy_names():
+        if nm not in node_names:
+            node_names.append(nm)
 
     lines = template_text.splitlines()
     out, i, injected = [], 0, False
